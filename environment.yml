@@ -1,0 +1,29 @@
+name: medvision
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch>=2.1
+  - torchvision
+  - torchaudio
+  - cudatoolkit=11.8
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - pillow
+  - tqdm
+  - pip
+  - pip:
+    - wandb
+    - timm
+    - gradio
+    - albumentations
+    - opencv-python
+    - grad-cam
+    - captum
+    - medmnist
+    - monai
