@@ -1,0 +1,41 @@
+# ViT experiment config — inherits defaults, overrides model block
+
+project:
+  name: medvision-ai
+  seed: 42
+
+data:
+  root: data/chestxray14
+  csv_path: data/chestxray14/Data_Entry_2017.csv
+  image_size: 224
+  batch_size: 16            # smaller batch for ViT memory
+  num_workers: 4
+  train_split: 0.7
+  val_split: 0.1
+  test_split: 0.2
+
+model:
+  backbone: vit_base_patch16_224
+  pretrained: true
+  num_classes: 14
+  dropout: 0.1
+
+training:
+  epochs: 30
+  lr: 5e-5                  # lower LR for ViT fine-tuning
+  weight_decay: 1e-4
+  scheduler: cosine
+  warmup_epochs: 5
+  mixed_precision: true
+  early_stopping_patience: 7
+
+xai:
+  method: gradcam
+  target_layer: blocks.11   # last transformer block for ViT
+  num_shap_samples: 100
+
+logging:
+  use_wandb: true
+  project: medvision-xai
+  save_dir: results/
+  log_interval: 10
