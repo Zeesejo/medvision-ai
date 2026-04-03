@@ -1,1 +1,1 @@
-from .classifier import MedVisionClassifier
+from .classifier import build_model, ChestXrayClassifier
