@@ -1,106 +1,158 @@
-"""Grad-CAM explainability wrapper using pytorch-grad-cam library.
-
-Install: pip install grad-cam
-Docs:    https://github.com/jacobgil/pytorch-grad-cam
 """
+Grad-CAM for ChestX-ray14 Multi-Label Classifier
+=================================================
+Generates class-specific heatmaps overlaid on chest X-rays.
+Used for paper figures and the Gradio UI.
 
-import logging
-from typing import List, Optional
+Usage:
+    from src.xai.gradcam import GradCAM, overlay_heatmap
+    cam = GradCAM(model, target_layer='layer4')  # resnet50
+    heatmap = cam(image_tensor, class_idx=2)     # class 2 = Effusion
+    vis = overlay_heatmap(original_image, heatmap)
+"""
 
 import numpy as np
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 import cv2
-
-from pytorch_grad_cam import (
-    GradCAM,
-    GradCAMPlusPlus,
-    EigenCAM,
-    ScoreCAM,
-)
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from pytorch_grad_cam.utils.image import show_cam_on_image
-
-logger = logging.getLogger(__name__)
-
-CAM_METHODS = {
-    "gradcam":      GradCAM,
-    "gradcam++":    GradCAMPlusPlus,
-    "eigencam":     EigenCAM,
-    "scorecam":     ScoreCAM,
-}
+from PIL import Image
+import torchvision.transforms as T
 
 
-class GradCAMExplainer:
-    """Generate saliency heatmaps for a MedVisionClassifier prediction."""
+class GradCAM:
+    """
+    Gradient-weighted Class Activation Mapping.
+    Works with ResNet50 and ViT backbones via timm.
+    """
 
-    def __init__(
+    def __init__(self, model, target_layer: str = 'layer4'):
+        self.model  = model
+        self.device = next(model.parameters()).device
+        self._features = None
+        self._grads    = None
+        self._hook_handles = []
+        self._register_hooks(target_layer)
+
+    def _register_hooks(self, target_layer: str):
+        # Navigate to the target layer in the backbone
+        layer = dict(self.model.backbone.named_modules()).get(target_layer)
+        if layer is None:
+            available = [n for n, _ in self.model.backbone.named_modules()]
+            raise ValueError(
+                f"Layer '{target_layer}' not found.\n"
+                f"Available layers: {available[-10:]}"  # show last 10
+            )
+
+        def fwd_hook(module, input, output):
+            self._features = output.detach()
+
+        def bwd_hook(module, grad_in, grad_out):
+            self._grads = grad_out[0].detach()
+
+        self._hook_handles.append(layer.register_forward_hook(fwd_hook))
+        self._hook_handles.append(layer.register_full_backward_hook(bwd_hook))
+
+    def remove_hooks(self):
+        for h in self._hook_handles:
+            h.remove()
+
+    def __call__(
         self,
-        model: nn.Module,
-        method: str = "gradcam",
-        device: Optional[torch.device] = None,
-    ):
-        if method not in CAM_METHODS:
-            raise ValueError(f"method must be one of {list(CAM_METHODS.keys())}")
-
-        self.model  = model.eval()
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
-
-        target_layers = [model.target_layer]
-        self.cam = CAM_METHODS[method](model=model, target_layers=target_layers)
-        logger.info(f"GradCAMExplainer | method={method} | target_layer={model.target_layer}")
-
-    def explain(
-        self,
-        image_tensor: torch.Tensor,
+        image_tensor: torch.Tensor,   # [1, 3, H, W]
         class_idx: int,
-        original_image: Optional[np.ndarray] = None,
-    ) -> dict:
-        """Generate a CAM heatmap for a single image and class.
-
-        Args:
-            image_tensor:   (1, 3, H, W) normalised input tensor
-            class_idx:      Target class index (0-13 for ChestX-ray14)
-            original_image: (H, W, 3) float32 [0,1] for overlay — if None, skip overlay
-
-        Returns:
-            dict with keys:
-                'heatmap'  : (H, W) float32 CAM map in [0, 1]
-                'overlay'  : (H, W, 3) float32 RGB overlay — only if original_image provided
-                'class_idx': int
+    ) -> np.ndarray:
         """
-        targets      = [ClassifierOutputTarget(class_idx)]
-        grayscale_cam = self.cam(input_tensor=image_tensor.to(self.device), targets=targets)
-        heatmap       = grayscale_cam[0]  # (H, W)
-
-        result = {"heatmap": heatmap, "class_idx": class_idx}
-
-        if original_image is not None:
-            overlay = show_cam_on_image(original_image.astype(np.float32), heatmap, use_rgb=True)
-            result["overlay"] = overlay
-
-        return result
-
-    def explain_topk(
-        self,
-        image_tensor: torch.Tensor,
-        k: int = 3,
-        original_image: Optional[np.ndarray] = None,
-    ) -> List[dict]:
-        """Generate CAM heatmaps for the top-k predicted classes.
-
-        Returns:
-            List of result dicts sorted by predicted probability (descending)
+        Returns a normalised heatmap [H, W] in range [0, 1].
         """
-        with torch.no_grad():
-            probs = self.model.get_probabilities(image_tensor.to(self.device))
-            topk  = torch.topk(probs[0], k=k)
+        self.model.eval()
+        image_tensor = image_tensor.to(self.device)
+        image_tensor.requires_grad_(True)
 
-        results = []
-        for prob, cls_idx in zip(topk.values.cpu().tolist(), topk.indices.cpu().tolist()):
-            r = self.explain(image_tensor, cls_idx, original_image)
-            r["probability"] = prob
-            results.append(r)
+        # Forward pass
+        logits = self.model(image_tensor)          # [1, 14]
+        score  = logits[0, class_idx]
 
-        return results
+        # Backward pass
+        self.model.zero_grad()
+        score.backward()
+
+        # Pool gradients over spatial dims
+        weights  = self._grads.mean(dim=(2, 3), keepdim=True)  # [1, C, 1, 1]
+        cam      = (weights * self._features).sum(dim=1)        # [1, H, W]
+        cam      = F.relu(cam).squeeze(0).cpu().numpy()         # [H, W]
+
+        # Normalise to [0, 1]
+        cam -= cam.min()
+        if cam.max() > 0:
+            cam /= cam.max()
+        return cam
+
+
+def overlay_heatmap(
+    original_image: Image.Image,
+    heatmap: np.ndarray,
+    alpha: float = 0.45,
+    colormap: int = cv2.COLORMAP_JET,
+) -> Image.Image:
+    """
+    Overlay a Grad-CAM heatmap on the original X-ray image.
+
+    Args:
+        original_image : PIL Image (grayscale or RGB)
+        heatmap        : [H, W] float32 array in [0, 1]
+        alpha          : heatmap opacity
+        colormap       : OpenCV colormap
+
+    Returns:
+        PIL Image with heatmap overlay
+    """
+    # Resize heatmap to image size
+    img_w, img_h = original_image.size
+    heatmap_uint8 = (heatmap * 255).astype(np.uint8)
+    heatmap_resized = cv2.resize(heatmap_uint8, (img_w, img_h))
+    heatmap_colored = cv2.applyColorMap(heatmap_resized, colormap)  # BGR
+    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+
+    # Convert original to RGB numpy
+    img_rgb = np.array(original_image.convert('RGB'))
+
+    # Blend
+    blended = (1 - alpha) * img_rgb + alpha * heatmap_colored
+    blended = np.clip(blended, 0, 255).astype(np.uint8)
+    return Image.fromarray(blended)
+
+
+def get_image_tensor(
+    image_path: str,
+    image_size: int = 224,
+) -> tuple:
+    """
+    Load image and return (tensor [1,3,H,W], original PIL Image).
+    """
+    transform = T.Compose([
+        T.Resize((image_size, image_size)),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406],
+                    [0.229, 0.224, 0.225]),
+    ])
+    img = Image.open(image_path).convert('RGB')
+    tensor = transform(img).unsqueeze(0)  # [1, 3, H, W]
+    return tensor, img
+
+
+if __name__ == '__main__':
+    # Quick test with a dummy model
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from src.models.classifier import build_model
+
+    model = build_model(backbone='resnet50', pretrained=False, device='cpu')
+    cam   = GradCAM(model, target_layer='layer4')
+
+    dummy = torch.randn(1, 3, 224, 224)
+    hmap  = cam(dummy, class_idx=0)
+    print(f'Heatmap shape : {hmap.shape}')   # (7, 7)
+    print(f'Heatmap range : [{hmap.min():.3f}, {hmap.max():.3f}]')
+    cam.remove_hooks()
+    print('GradCAM test passed ✓')

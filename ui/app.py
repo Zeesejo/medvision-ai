@@ -1,102 +1,151 @@
 """
-Gradio web UI for MedVision AI.
-Features: image upload, prediction, Grad-CAM overlay, confidence bar chart.
+MedVision-AI — Gradio Web Interface
+=====================================
+Upload a chest X-ray → get disease predictions + Grad-CAM heatmap.
 
-Run:
+Usage:
     python ui/app.py
+    python ui/app.py --checkpoint results/checkpoints/resnet50_best.pth
+
+Requires:
+    pip install gradio opencv-python-headless
 """
-from pathlib import Path
+
 import sys
+import argparse
+from pathlib import Path
+
+import yaml
 import numpy as np
 import torch
-from torchvision import transforms
+import gradio as gr
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from src.models.classifier import build_model
+from src.xai.gradcam import GradCAM, overlay_heatmap, get_image_tensor
+from src.data.dataset import CLASS_NAMES
 
-DISEASE_LABELS = [
-    "Atelectasis", "Cardiomegaly", "Effusion", "Infiltration", "Mass",
-    "Nodule", "Pneumonia", "Pneumothorax", "Consolidation", "Edema",
-    "Emphysema", "Fibrosis", "Pleural_Thickening", "Hernia",
-]
-CHECKPOINT = "results/checkpoints/finetune/model_best.pt"
+# ── Config ──
+def load_config(path='config.yaml'):
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+cfg    = load_config()
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# ── Load model once at startup ──
+parser = argparse.ArgumentParser()
+parser.add_argument('--checkpoint', default=None)
+args, _ = parser.parse_known_args()
+
+CKPT = args.checkpoint or str(
+    Path(cfg['logging']['save_dir']) / f"{cfg['model']['backbone']}_best.pth"
+)
+
+print(f'Loading model from {CKPT}...')
+model = build_model(
+    backbone        = cfg['model']['backbone'],
+    pretrained      = False,
+    checkpoint_path = CKPT,
+    device          = device,
+)
+model.eval()
+gradcam = GradCAM(model, target_layer='layer4')
+print('Model ready.')
 
 
-def load_model():
-    from models.encoder import MedEncoder, MultiLabelClassifier
-    encoder = MedEncoder(arch="resnet50", pretrained=True)
-    model = MultiLabelClassifier(encoder, num_classes=14)
-    if Path(CHECKPOINT).exists():
-        ckpt = torch.load(CHECKPOINT, map_location="cpu")
-        model.load_state_dict(ckpt["model_state_dict"])
-        print(f"Loaded checkpoint: {CHECKPOINT}")
-    else:
-        print("No checkpoint found — using ImageNet-pretrained encoder (demo mode).")
-    model.eval()
-    return model
+# ── Inference function ──
+def predict(image: Image.Image, top_k: int = 5, cam_class: str = 'Auto (top prediction)'):
+    if image is None:
+        return None, "Please upload a chest X-ray image."
 
+    # Preprocess
+    import torchvision.transforms as T
+    transform = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    tensor = transform(image.convert('RGB')).unsqueeze(0).to(device)
 
-transform = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-])
-
-model = load_model()
-
-
-def predict(image: Image.Image):
-    """Run inference and return top-5 predictions + Grad-CAM heatmap."""
-    tensor = transform(image.convert("RGB")).unsqueeze(0)
+    # Inference
     with torch.no_grad():
-        probs = torch.sigmoid(model(tensor))[0].numpy()
+        logits = model(tensor)
+        probs  = torch.sigmoid(logits).squeeze(0).cpu().numpy()
 
-    top5_idx = np.argsort(probs)[::-1][:5]
-    predictions = {DISEASE_LABELS[i]: float(probs[i]) for i in top5_idx}
+    # Sort by probability
+    indices   = np.argsort(probs)[::-1]
+    top_class = indices[0]
 
-    # Grad-CAM overlay (requires grad-cam package)
-    try:
-        from pytorch_grad_cam import GradCAM
-        from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-        from pytorch_grad_cam.utils.image import show_cam_on_image
+    # Grad-CAM
+    if cam_class == 'Auto (top prediction)':
+        cam_idx = int(top_class)
+    else:
+        cam_idx = CLASS_NAMES.index(cam_class)
 
-        target_layers = [model.encoder.backbone.layer4[-1]]
-        cam = GradCAM(model=model, target_layers=target_layers)
-        heatmap = cam(input_tensor=tensor,
-                      targets=[ClassifierOutputTarget(int(top5_idx[0]))])[0]
-        rgb = np.array(image.convert("RGB").resize((224, 224))) / 255.0
-        overlay = show_cam_on_image(rgb.astype(np.float32), heatmap, use_rgb=True)
-        overlay_pil = Image.fromarray(overlay)
-    except Exception:
-        overlay_pil = image  # fallback
+    heatmap    = gradcam(tensor, class_idx=cam_idx)
+    overlay    = overlay_heatmap(image.convert('RGB'), heatmap, alpha=0.45)
 
-    return predictions, overlay_pil
+    # Build results text
+    lines = [f"{'Disease':<28} {'Probability':>12}\n" + "-"*42]
+    for i in indices[:top_k]:
+        bar  = "█" * int(probs[i] * 20)
+        flag = " ⚠️" if probs[i] > 0.5 else ""
+        lines.append(f"{CLASS_NAMES[i]:<28} {probs[i]:>8.1%}  {bar}{flag}")
 
+    result_text = "\n".join(lines)
+    result_text += f"\n\nGrad-CAM shown for: {CLASS_NAMES[cam_idx]}"
 
-def launch():
-    try:
-        import gradio as gr
-    except ImportError:
-        raise ImportError("pip install gradio")
-
-    with gr.Blocks(title="MedVision AI — Chest X-Ray Analysis") as demo:
-        gr.Markdown("## 🩺 MedVision AI — Chest X-Ray Disease Classifier")
-        gr.Markdown(
-            "Upload a chest X-ray. The model predicts pathology probabilities "
-            "and shows a Grad-CAM explanation overlay.  \n"
-            "**⚠️ Research demo only — not for clinical use.**"
-        )
-        with gr.Row():
-            input_img = gr.Image(type="pil", label="Input X-Ray")
-            overlay_img = gr.Image(type="pil", label="Grad-CAM Overlay")
-        with gr.Row():
-            output_labels = gr.Label(num_top_classes=5, label="Top-5 Predictions")
-        btn = gr.Button("Analyze")
-        btn.click(fn=predict, inputs=input_img, outputs=[output_labels, overlay_img])
-
-    demo.launch(share=False)
+    return overlay, result_text
 
 
-if __name__ == "__main__":
-    launch()
+# ── Gradio UI ──
+with gr.Blocks(
+    title="MedVision-AI — Chest X-Ray Analysis",
+    theme=gr.themes.Soft(primary_hue="teal"),
+) as demo:
+
+    gr.Markdown("""
+    # 🫑 MedVision-AI — Chest X-Ray Disease Detection
+    Upload a chest X-ray to detect 14 pathologies with AI.
+    Grad-CAM heatmap shows **which regions** the model focuses on.
+    > ⚠️ For research purposes only. Not a medical device.
+    """)
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            img_input  = gr.Image(type='pil', label='Upload Chest X-Ray')
+            top_k      = gr.Slider(1, 14, value=5, step=1, label='Show top-K predictions')
+            cam_class  = gr.Dropdown(
+                choices=['Auto (top prediction)'] + CLASS_NAMES,
+                value='Auto (top prediction)',
+                label='Grad-CAM target class'
+            )
+            btn = gr.Button('Analyse', variant='primary')
+
+        with gr.Column(scale=1):
+            img_output  = gr.Image(label='Grad-CAM Heatmap')
+            text_output = gr.Textbox(label='Predictions', lines=10, max_lines=20)
+
+    btn.click(
+        fn=predict,
+        inputs=[img_input, top_k, cam_class],
+        outputs=[img_output, text_output]
+    )
+
+    gr.Examples(
+        examples=[],
+        inputs=img_input,
+    )
+
+    gr.Markdown("""
+    ---
+    **Model:** ResNet50 pretrained on ImageNet, fine-tuned on NIH ChestX-ray14 (112,120 images)
+    **Classes:** Atelectasis, Cardiomegaly, Effusion, Infiltration, Mass, Nodule,
+    Pneumonia, Pneumothorax, Consolidation, Edema, Emphysema, Fibrosis, Pleural Thickening, Hernia
+    """)
+
+
+if __name__ == '__main__':
+    demo.launch(share=False, server_port=7860)
