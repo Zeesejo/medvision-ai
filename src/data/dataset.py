@@ -1,15 +1,15 @@
 """
 NIH ChestX-ray14 Dataset
 ========================
-Loads images + multi-label targets from Data_Entry_2017.csv.
-Returns DataLoaders for train / val / test splits.
+Handles images split across images_001 ... images_012 subfolders.
 """
 
 import os
+import glob
 import numpy as np
 import pandas as pd
 from PIL import Image
-from typing import Tuple, Dict
+from typing import Dict
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -26,7 +26,7 @@ NUM_CLASSES = len(CLASS_NAMES)
 class ChestXrayDataset(Dataset):
     def __init__(self, image_paths, labels, transform=None):
         self.image_paths = image_paths
-        self.labels      = labels          # np.ndarray [N, 14] float32
+        self.labels      = labels
         self.transform   = transform
 
     def __len__(self):
@@ -60,8 +60,27 @@ def _build_transforms(image_size: int, split: str):
         ])
 
 
+def _build_image_index(data_dir: str) -> dict:
+    """
+    Scan all images_001 ... images_012 subfolders and build
+    a dict mapping filename -> full path.
+    """
+    index = {}
+    # Match both images/ (flat) and images_001..images_012 (split)
+    patterns = [
+        os.path.join(data_dir, 'images', '*.png'),
+        os.path.join(data_dir, 'images_*', 'images', '*.png'),
+        os.path.join(data_dir, 'images_*', '*.png'),
+    ]
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            fname = os.path.basename(path)
+            index[fname] = path
+    print(f"Image index built: {len(index):,} images found")
+    return index
+
+
 def _parse_labels(finding_labels: pd.Series) -> np.ndarray:
-    """Convert pipe-separated label strings to binary matrix."""
     labels = np.zeros((len(finding_labels), NUM_CLASSES), dtype=np.float32)
     for i, findings in enumerate(finding_labels):
         if findings != 'No Finding':
@@ -77,23 +96,23 @@ def get_dataloaders(
     image_size: int = 224,
     batch_size: int = 32,
     num_workers: int = 4,
-    images_subdir: str = 'images',
+    images_subdir: str = 'images',   # kept for API compat, not used
     labels_file: str = 'Data_Entry_2017.csv',
     train_val_list: str = 'train_val_list.txt',
     test_list: str = 'test_list.txt',
 ) -> Dict:
-    """
-    Returns dict with keys: 'train', 'val', 'test', 'pos_weights', 'class_names'
-    """
+
+    # ---- Build image index (handles split subfolders) ----
+    img_index = _build_image_index(data_dir)
+
     # ---- Load metadata ----
     df = pd.read_csv(os.path.join(data_dir, labels_file))
     df = df[['Image Index', 'Finding Labels']].copy()
+    df['path'] = df['Image Index'].map(img_index)
+    df = df.dropna(subset=['path']).reset_index(drop=True)
+    print(f"Matched {len(df):,} entries from CSV to image files")
 
-    images_dir = os.path.join(data_dir, images_subdir)
-    df['path'] = df['Image Index'].apply(lambda x: os.path.join(images_dir, x))
-    df = df[df['path'].apply(os.path.exists)].reset_index(drop=True)
-
-    # ---- Train / val / test split from official lists ----
+    # ---- Official train/val/test split ----
     with open(os.path.join(data_dir, train_val_list)) as f:
         train_val_files = set(f.read().splitlines())
     with open(os.path.join(data_dir, test_list)) as f:
@@ -102,34 +121,31 @@ def get_dataloaders(
     train_val_df = df[df['Image Index'].isin(train_val_files)].reset_index(drop=True)
     test_df      = df[df['Image Index'].isin(test_files)].reset_index(drop=True)
 
-    # 90/10 split of train_val for train/val
     val_size  = int(0.1 * len(train_val_df))
     val_df    = train_val_df.iloc[:val_size].reset_index(drop=True)
     train_df  = train_val_df.iloc[val_size:].reset_index(drop=True)
 
-    # ---- Parse labels ----
+    # ---- Labels ----
     train_labels = _parse_labels(train_df['Finding Labels'])
     val_labels   = _parse_labels(val_df['Finding Labels'])
     test_labels  = _parse_labels(test_df['Finding Labels'])
 
-    # ---- Positive weights for BCE loss ----
+    # ---- Positive weights ----
     pos_counts  = train_labels.sum(axis=0)
     neg_counts  = len(train_labels) - pos_counts
     pos_weights = torch.tensor(neg_counts / (pos_counts + 1e-6), dtype=torch.float32)
 
-    # ---- Build datasets ----
+    # ---- Datasets ----
     train_dataset = ChestXrayDataset(train_df['path'].tolist(), train_labels, _build_transforms(image_size, 'train'))
     val_dataset   = ChestXrayDataset(val_df['path'].tolist(),   val_labels,   _build_transforms(image_size, 'val'))
     test_dataset  = ChestXrayDataset(test_df['path'].tolist(),  test_labels,  _build_transforms(image_size, 'test'))
 
-    print(f"Dataset sizes — Train: {len(train_dataset):,} | Val: {len(val_dataset):,} | Test: {len(test_dataset):,}")
+    print(f"Split  —  Train: {len(train_dataset):,} | Val: {len(val_dataset):,} | Test: {len(test_dataset):,}")
 
-    # ---- DataLoaders ----
-    loaders = {
-        'train': DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=num_workers, pin_memory=True),
-        'val':   DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True),
-        'test':  DataLoader(test_dataset,  batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True),
-        'pos_weights':  pos_weights,
-        'class_names':  CLASS_NAMES,
+    return {
+        'train':       DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=num_workers, pin_memory=True),
+        'val':         DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True),
+        'test':        DataLoader(test_dataset,  batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True),
+        'pos_weights': pos_weights,
+        'class_names': CLASS_NAMES,
     }
-    return loaders
