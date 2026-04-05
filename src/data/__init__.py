@@ -1,1 +1,1 @@
-from .chestxray import ChestXray14Dataset, get_transforms, get_dataloaders
+from .dataset import ChestXrayDataset, get_dataloaders

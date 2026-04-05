@@ -1,0 +1,52 @@
+# MedVision-AI — Central Configuration
+# Update data_dir to match your local path before training
+
+data:
+  data_dir: "E:/medvision-data/chestxray14"   # <-- update this
+  images_subdir: "images"
+  labels_file: "Data_Entry_2017.csv"
+  train_val_list: "train_val_list.txt"
+  test_list: "test_list.txt"
+  image_size: 224
+  num_workers: 4
+
+model:
+  backbone: "resnet50"          # resnet50 | vit_base_patch16_224
+  pretrained: true
+  dropout: 0.3
+  freeze_backbone: false
+
+training:
+  epochs: 30
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  loss: "asl"                   # bce | focal | asl
+  scheduler: "cosine"           # cosine | step | none
+  warmup_epochs: 3
+  early_stopping_patience: 7
+  amp: true                     # mixed precision (faster on GPU)
+  grad_clip: 1.0
+
+logging:
+  use_wandb: false              # set true after: pip install wandb && wandb login
+  project: "medvision-ai"
+  run_name: "resnet50-asl-v1"
+  save_dir: "results/checkpoints"
+  log_every_n_steps: 50
+
+classes:
+  - Atelectasis
+  - Cardiomegaly
+  - Effusion
+  - Infiltration
+  - Mass
+  - Nodule
+  - Pneumonia
+  - Pneumothorax
+  - Consolidation
+  - Edema
+  - Emphysema
+  - Fibrosis
+  - Pleural_Thickening
+  - Hernia

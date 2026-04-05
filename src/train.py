@@ -1,266 +1,261 @@
-"""Training entry point for MedVision-AI.
-
+"""
+MedVision-AI — Training Script
+================================
 Usage:
-    python -m src.train --config configs/default.yaml
-    python -m src.train --config configs/vit_experiment.yaml
+    python src/train.py                        # uses config.yaml defaults
+    python src/train.py --backbone vit_base_patch16_224
+    python src/train.py --epochs 50 --lr 3e-4
 """
 
+import os
+import sys
 import argparse
-import logging
-import random
+import time
 from pathlib import Path
 
+import yaml
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
+from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
-import yaml
 
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-
-from src.data.chestxray import get_dataloaders
-from src.models.classifier import MedVisionClassifier
-from src.utils.metrics import compute_metrics
-from src.utils.logger import setup_logger
-
-logger = setup_logger("medvision.train")
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from src.models.classifier import build_model
+from src.models.losses import WeightedBCELoss, FocalLoss, AsymmetricLoss
+from src.data.dataset import get_dataloaders
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark     = False
-
-
-def load_config(path: str) -> dict:
-    with open(path, "r") as f:
+# ─────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────
+def load_config(path: str = 'config.yaml') -> dict:
+    with open(path) as f:
         return yaml.safe_load(f)
 
 
-def build_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
-    name    = cfg["training"]["scheduler"]
-    epochs  = cfg["training"]["epochs"]
-    warmup  = cfg["training"].get("warmup_epochs", 0)
-
-    if name == "cosine":
-        return optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs - warmup, eta_min=1e-6
-        )
-    if name == "step":
-        return optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-    if name == "plateau":
-        return optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
-    raise ValueError(f"Unknown scheduler: {name}")
+def parse_args():
+    parser = argparse.ArgumentParser(description='MedVision-AI Trainer')
+    parser.add_argument('--config',   default='config.yaml')
+    parser.add_argument('--backbone', default=None)
+    parser.add_argument('--epochs',   type=int, default=None)
+    parser.add_argument('--lr',       type=float, default=None)
+    parser.add_argument('--batch',    type=int, default=None)
+    parser.add_argument('--loss',     default=None, choices=['bce', 'focal', 'asl'])
+    parser.add_argument('--data_dir', default=None)
+    return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Train / Validate
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────
+# Loss factory
+# ─────────────────────────────────────────
+def build_loss(loss_name: str, pos_weights: torch.Tensor):
+    if loss_name == 'bce':
+        return WeightedBCELoss(pos_weights)
+    elif loss_name == 'focal':
+        return FocalLoss(gamma=2.0)
+    elif loss_name == 'asl':
+        return AsymmetricLoss(gamma_neg=4, gamma_pos=0, clip=0.05)
+    raise ValueError(f'Unknown loss: {loss_name}')
 
-def train_one_epoch(
-    model, loader, optimizer, criterion, scaler, device, epoch, cfg
-) -> float:
+
+# ─────────────────────────────────────────
+# AUC metric
+# ─────────────────────────────────────────
+def compute_auc(all_labels: np.ndarray, all_probs: np.ndarray, class_names: list) -> dict:
+    aucs = {}
+    for i, name in enumerate(class_names):
+        if len(np.unique(all_labels[:, i])) > 1:
+            aucs[name] = roc_auc_score(all_labels[:, i], all_probs[:, i])
+        else:
+            aucs[name] = float('nan')
+    valid = [v for v in aucs.values() if not np.isnan(v)]
+    aucs['mean'] = np.mean(valid) if valid else 0.0
+    return aucs
+
+
+# ─────────────────────────────────────────
+# Train one epoch
+# ─────────────────────────────────────────
+def train_epoch(model, loader, optimizer, criterion, scaler, device, use_amp, grad_clip):
     model.train()
     total_loss = 0.0
-    log_interval = cfg["logging"]["log_interval"]
+    pbar = tqdm(loader, desc='  Train', leave=False)
 
-    for step, (images, labels) in enumerate(tqdm(loader, desc=f"Epoch {epoch} [train]", leave=False)):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
+    for imgs, labels in pbar:
+        imgs, labels = imgs.to(device), labels.to(device)
         optimizer.zero_grad()
 
-        if cfg["training"]["mixed_precision"]:
-            with autocast():
-                logits = model(images)
-                loss   = criterion(logits, labels)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            logits = model(images)
+        with autocast(enabled=use_amp):
+            logits = model(imgs)
             loss   = criterion(logits, labels)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
-
-        if (step + 1) % log_interval == 0:
-            logger.info(f"  step {step+1}/{len(loader)} | loss={loss.item():.4f}")
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
     return total_loss / len(loader)
 
 
+# ─────────────────────────────────────────
+# Evaluate
+# ─────────────────────────────────────────
 @torch.no_grad()
-def evaluate(
-    model, loader, criterion, device
-):
+def evaluate(model, loader, criterion, device, use_amp, class_names):
     model.eval()
     total_loss = 0.0
-    all_probs  = []
-    all_targets = []
+    all_labels, all_probs = [], []
 
-    for images, labels in tqdm(loader, desc="Evaluating", leave=False):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        logits = model(images)
-        loss   = criterion(logits, labels)
+    for imgs, labels in tqdm(loader, desc='  Eval ', leave=False):
+        imgs, labels = imgs.to(device), labels.to(device)
+        with autocast(enabled=use_amp):
+            logits = model(imgs)
+            loss   = criterion(logits, labels)
         total_loss += loss.item()
+        all_labels.append(labels.cpu().numpy())
+        all_probs.append(torch.sigmoid(logits).cpu().numpy())
 
-        probs = torch.sigmoid(logits).cpu().numpy()
-        all_probs.append(probs)
-        all_targets.append(labels.cpu().numpy())
-
-    all_probs   = np.concatenate(all_probs,   axis=0)
-    all_targets = np.concatenate(all_targets, axis=0)
-    metrics     = compute_metrics(all_targets, all_probs)
-    metrics["loss"] = total_loss / len(loader)
-    return metrics
+    all_labels = np.concatenate(all_labels)
+    all_probs  = np.concatenate(all_probs)
+    aucs = compute_auc(all_labels, all_probs, class_names)
+    return total_loss / len(loader), aucs
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────
 # Main
-# ---------------------------------------------------------------------------
-
+# ─────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Train MedVision-AI")
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
-    args = parser.parse_args()
+    args   = parse_args()
+    cfg    = load_config(args.config)
 
-    cfg = load_config(args.config)
-    set_seed(cfg["project"]["seed"])
+    # CLI overrides
+    if args.backbone: cfg['model']['backbone']         = args.backbone
+    if args.epochs:   cfg['training']['epochs']        = args.epochs
+    if args.lr:       cfg['training']['learning_rate'] = args.lr
+    if args.batch:    cfg['training']['batch_size']    = args.batch
+    if args.loss:     cfg['training']['loss']          = args.loss
+    if args.data_dir: cfg['data']['data_dir']          = args.data_dir
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-    if device.type == "cuda":
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+    # ── Device ──
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f'\nDevice : {device}')
+    if device == 'cuda':
+        print(f'GPU    : {torch.cuda.get_device_name(0)}')
 
-    # W&B
-    if cfg["logging"]["use_wandb"] and WANDB_AVAILABLE:
-        wandb.init(project=cfg["logging"]["project"], config=cfg, name=cfg["model"]["backbone"])
+    # ── Data ──
+    loaders = get_dataloaders(
+        data_dir      = cfg['data']['data_dir'],
+        image_size    = cfg['data']['image_size'],
+        batch_size    = cfg['training']['batch_size'],
+        num_workers   = cfg['data']['num_workers'],
+        images_subdir = cfg['data']['images_subdir'],
+        labels_file   = cfg['data']['labels_file'],
+        train_val_list= cfg['data']['train_val_list'],
+        test_list     = cfg['data']['test_list'],
+    )
+    class_names = loaders['class_names']
 
-    # Data
-    train_loader, val_loader, test_loader = get_dataloaders(
-        csv_path    = cfg["data"]["csv_path"],
-        image_dir   = str(Path(cfg["data"]["root"]) / "images"),
-        image_size  = cfg["data"]["image_size"],
-        batch_size  = cfg["data"]["batch_size"],
-        num_workers = cfg["data"]["num_workers"],
-        train_split = cfg["data"]["train_split"],
-        val_split   = cfg["data"]["val_split"],
-        seed        = cfg["project"]["seed"],
+    # ── Model ──
+    model = build_model(
+        backbone        = cfg['model']['backbone'],
+        pretrained      = cfg['model']['pretrained'],
+        dropout         = cfg['model']['dropout'],
+        freeze_backbone = cfg['model']['freeze_backbone'],
+        device          = device,
     )
 
-    # Model
-    model = MedVisionClassifier(
-        backbone    = cfg["model"]["backbone"],
-        num_classes = cfg["model"]["num_classes"],
-        pretrained  = cfg["model"]["pretrained"],
-        dropout     = cfg["model"]["dropout"],
-    ).to(device)
+    # ── Loss ──
+    criterion = build_loss(cfg['training']['loss'], loaders['pos_weights'].to(device))
 
-    # Loss — pos_weight to handle class imbalance (NIH dataset is heavily imbalanced)
-    # Approximate positive frequency per class: ~5-10%, so weight ~9-19
-    pos_weight = torch.ones(cfg["model"]["num_classes"]) * 10.0
-    criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
-
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr           = cfg["training"]["lr"],
-        weight_decay = cfg["training"]["weight_decay"],
+    # ── Optimiser ──
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr           = cfg['training']['learning_rate'],
+        weight_decay = cfg['training']['weight_decay'],
     )
-    scheduler = build_scheduler(optimizer, cfg, len(train_loader))
-    scaler    = GradScaler(enabled=cfg["training"]["mixed_precision"])
 
-    # Resume
-    start_epoch  = 1
-    best_auc     = 0.0
-    patience_cnt = 0
-    save_dir     = Path(cfg["logging"]["save_dir"]) / cfg["model"]["backbone"]
+    # ── Scheduler ──
+    epochs = cfg['training']['epochs']
+    if cfg['training']['scheduler'] == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    elif cfg['training']['scheduler'] == 'step':
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    else:
+        scheduler = None
+
+    scaler    = GradScaler(enabled=cfg['training']['amp'])
+    save_dir  = Path(cfg['logging']['save_dir'])
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model_state"])
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-        start_epoch = ckpt["epoch"] + 1
-        best_auc    = ckpt.get("best_auc", 0.0)
-        logger.info(f"Resumed from epoch {ckpt['epoch']} (best_auc={best_auc:.4f})")
+    # ── Training loop ──
+    best_auc       = 0.0
+    patience_count = 0
+    patience       = cfg['training']['early_stopping_patience']
 
-    # Training loop
-    patience = cfg["training"]["early_stopping_patience"]
+    print(f'\nStarting training — {epochs} epochs\n')
+    print(f'{"Epoch":>6} {"Train Loss":>12} {"Val Loss":>10} {"Val AUC":>10} {"Best AUC":>10}')
+    print('-' * 55)
 
-    for epoch in range(start_epoch, cfg["training"]["epochs"] + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, epoch, cfg)
-        val_metrics = evaluate(model, val_loader, criterion, device)
+    for epoch in range(1, epochs + 1):
+        t0 = time.time()
 
-        logger.info(
-            f"Epoch {epoch:03d} | train_loss={train_loss:.4f} "
-            f"| val_loss={val_metrics['loss']:.4f} "
-            f"| val_auc={val_metrics['mean_auc']:.4f} "
-            f"| val_f1={val_metrics['macro_f1']:.4f}"
+        train_loss = train_epoch(
+            model, loaders['train'], optimizer, criterion,
+            scaler, device, cfg['training']['amp'], cfg['training']['grad_clip']
+        )
+        val_loss, val_aucs = evaluate(
+            model, loaders['val'], criterion, device,
+            cfg['training']['amp'], class_names
         )
 
-        # Scheduler step
-        if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(val_metrics["mean_auc"])
-        else:
+        if scheduler:
             scheduler.step()
 
-        # W&B logging
-        if cfg["logging"]["use_wandb"] and WANDB_AVAILABLE:
-            wandb.log({"epoch": epoch, "train_loss": train_loss, **{f"val/{k}": v for k, v in val_metrics.items()}})
+        mean_auc = val_aucs['mean']
+        elapsed  = time.time() - t0
+        print(f'{epoch:>6} {train_loss:>12.4f} {val_loss:>10.4f} {mean_auc:>10.4f} {best_auc:>10.4f}  [{elapsed:.0f}s]')
 
-        # Checkpoint
-        ckpt = {
-            "epoch":           epoch,
-            "model_state":     model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "best_auc":        best_auc,
-            "config":          cfg,
-        }
-        torch.save(ckpt, save_dir / "last.pth")
-
-        if val_metrics["mean_auc"] > best_auc:
-            best_auc     = val_metrics["mean_auc"]
-            patience_cnt = 0
-            torch.save(ckpt, save_dir / "best.pth")
-            logger.info(f"  *** New best AUC: {best_auc:.4f} — checkpoint saved ***")
+        # ── Save best checkpoint ──
+        if mean_auc > best_auc:
+            best_auc = mean_auc
+            patience_count = 0
+            ckpt_path = save_dir / f'{cfg["model"]["backbone"]}_best.pth'
+            torch.save({
+                'epoch':            epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_auc':          mean_auc,
+                'val_aucs':         val_aucs,
+                'config':           cfg,
+            }, ckpt_path)
+            print(f'         ✓ Saved checkpoint → {ckpt_path}')
         else:
-            patience_cnt += 1
-            if patience_cnt >= patience:
-                logger.info(f"Early stopping triggered at epoch {epoch}")
+            patience_count += 1
+            if patience_count >= patience:
+                print(f'\nEarly stopping at epoch {epoch} (patience={patience})')
                 break
 
-    # Final test evaluation
-    logger.info("\n--- Final Test Evaluation ---")
-    best_ckpt = torch.load(save_dir / "best.pth", map_location=device)
-    model.load_state_dict(best_ckpt["model_state"])
-    test_metrics = evaluate(model, test_loader, criterion, device)
-    logger.info(f"Test results: {test_metrics}")
+    # ── Final test evaluation ──
+    print('\nRunning test set evaluation...')
+    test_loss, test_aucs = evaluate(
+        model, loaders['test'], criterion, device,
+        cfg['training']['amp'], class_names
+    )
+    print(f'\nTest Loss : {test_loss:.4f}')
+    print(f'Test AUC  : {test_aucs["mean"]:.4f}')
+    print('\nPer-class AUC:')
+    for name, auc in test_aucs.items():
+        if name != 'mean':
+            print(f'  {name:<25} {auc:.4f}')
 
-    if cfg["logging"]["use_wandb"] and WANDB_AVAILABLE:
-        wandb.log({f"test/{k}": v for k, v in test_metrics.items()})
-        wandb.finish()
+    print('\nTraining complete!')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
