@@ -17,7 +17,7 @@ import yaml
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
@@ -87,7 +87,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler, device, use_amp, gr
         imgs, labels = imgs.to(device), labels.to(device)
         optimizer.zero_grad()
 
-        with autocast(enabled=use_amp):
+        with autocast(device_type='cuda', enabled=use_amp):
             logits = model(imgs)
             loss   = criterion(logits, labels)
 
@@ -114,7 +114,7 @@ def evaluate(model, loader, criterion, device, use_amp, class_names):
 
     for imgs, labels in tqdm(loader, desc='  Eval ', leave=False):
         imgs, labels = imgs.to(device), labels.to(device)
-        with autocast(enabled=use_amp):
+        with autocast(device_type='cuda', enabled=use_amp):
             logits = model(imgs)
             loss   = criterion(logits, labels)
         total_loss += loss.item()
@@ -189,7 +189,7 @@ def main():
     else:
         scheduler = None
 
-    scaler    = GradScaler(enabled=cfg['training']['amp'])
+    scaler    = GradScaler('cuda', enabled=cfg['training']['amp'])
     save_dir  = Path(cfg['logging']['save_dir'])
     save_dir.mkdir(parents=True, exist_ok=True)
 
