@@ -8,6 +8,7 @@ Upgrades over train.py:
   * Cosine LR schedule with warmup
   * Test-Time Augmentation (TTA) at validation
   * Fixed AMP deprecation warning
+  * Weights & Biases (wandb) experiment tracking
 Expected AUC gain: +0.04 - 0.07 over ResNet-50 baseline
 """
 
@@ -22,6 +23,7 @@ from torch.amp import autocast, GradScaler
 from torchvision import transforms, models
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
+import wandb
 
 # ── repo imports ──────────────────────────────────────────────────────────────
 import sys
@@ -36,19 +38,21 @@ CLASSES = [
     "Consolidation", "Edema", "Emphysema", "Fibrosis",
     "Pleural_Thickening", "Hernia"
 ]
-NUM_CLASSES = len(CLASSES)
-IMG_SIZE    = 320          # upgraded from 224
-BATCH_SIZE  = 32
-NUM_EPOCHS  = 30
-LR_HEAD     = 3e-4         # classifier head LR
-LR_BACKBONE = 3e-5         # backbone LR (after unfreezing)
+NUM_CLASSES   = len(CLASSES)
+IMG_SIZE      = 320
+BATCH_SIZE    = 32
+NUM_EPOCHS    = 30
+LR_HEAD       = 3e-4
+LR_BACKBONE   = 3e-5
 WARMUP_EPOCHS = 2
-PATIENCE    = 8
+PATIENCE      = 8
 
+# ── wandb config ──────────────────────────────────────────────────────────────
+WB_PROJECT = "medvision-ai"
+WB_ENTITY  = None   # set to your wandb username if needed, else None
 
 # ── model ─────────────────────────────────────────────────────────────────────
 def build_model(num_classes: int, pretrained: bool = True) -> nn.Module:
-    """DenseNet-121 with custom multi-label head (CheXNet-style)."""
     weights = models.DenseNet121_Weights.IMAGENET1K_V1 if pretrained else None
     model   = models.densenet121(weights=weights)
     in_features = model.classifier.in_features      # 1024
@@ -63,14 +67,12 @@ def build_model(num_classes: int, pretrained: bool = True) -> nn.Module:
 
 
 def freeze_backbone(model: nn.Module):
-    """Freeze all layers except the classifier head."""
     for name, param in model.named_parameters():
         if "classifier" not in name:
             param.requires_grad = False
 
 
 def unfreeze_backbone(model: nn.Module):
-    """Unfreeze all layers for full fine-tuning."""
     for param in model.parameters():
         param.requires_grad = True
 
@@ -94,7 +96,6 @@ val_transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-# TTA transforms — 5 crops + horizontal flip
 tta_transforms = [
     transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
@@ -116,34 +117,6 @@ tta_transforms = [
 ]
 
 
-# ── TTA evaluation ────────────────────────────────────────────────────────────
-def evaluate_with_tta(model, dataset_cls, csv_path, img_dir, device):
-    """Run inference with TTA and return mean AUC."""
-    model.eval()
-    all_preds = []
-    for tfm in tta_transforms:
-        ds     = dataset_cls(csv_path, img_dir, transform=tfm)
-        loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False,
-                            num_workers=4, pin_memory=True)
-        preds, labels = [], []
-        with torch.no_grad():
-            for imgs, lbs in tqdm(loader, desc="TTA eval", leave=False):
-                imgs = imgs.to(device)
-                with autocast('cuda'):
-                    logits = model(imgs)
-                preds.append(torch.sigmoid(logits).cpu().numpy())
-                labels.append(lbs.numpy())
-        all_preds.append(np.concatenate(preds))
-        all_labels = np.concatenate(labels)
-
-    avg_preds = np.mean(all_preds, axis=0)
-    aucs = []
-    for i in range(NUM_CLASSES):
-        if all_labels[:, i].sum() > 0:
-            aucs.append(roc_auc_score(all_labels[:, i], avg_preds[:, i]))
-    return float(np.mean(aucs))
-
-
 # ── standard evaluation ───────────────────────────────────────────────────────
 def evaluate(model, loader, criterion, device):
     model.eval()
@@ -161,11 +134,14 @@ def evaluate(model, loader, criterion, device):
     preds  = np.concatenate(preds)
     labels = np.concatenate(labels)
     aucs   = []
-    for i in range(NUM_CLASSES):
+    per_class = {}
+    for i, cls in enumerate(CLASSES):
         if labels[:, i].sum() > 0:
-            aucs.append(roc_auc_score(labels[:, i], preds[:, i]))
+            auc = roc_auc_score(labels[:, i], preds[:, i])
+            aucs.append(auc)
+            per_class[f"val_auc/{cls}"] = auc
     mean_auc = float(np.mean(aucs))
-    return total_loss / len(loader), mean_auc, aucs
+    return total_loss / len(loader), mean_auc, per_class
 
 
 # ── lr scheduler with warmup ──────────────────────────────────────────────────
@@ -183,8 +159,33 @@ def get_scheduler(optimizer, warmup_epochs, total_epochs, steps_per_epoch):
 # ── main training loop ────────────────────────────────────────────────────────
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    print(f"Input size: {IMG_SIZE}x{IMG_SIZE}")
+
+    # ── init wandb
+    run = wandb.init(
+        project=WB_PROJECT,
+        entity=WB_ENTITY,
+        name=f"densenet121-320px-asl",
+        config={
+            "backbone":       "densenet121",
+            "img_size":       IMG_SIZE,
+            "batch_size":     BATCH_SIZE,
+            "epochs":         NUM_EPOCHS,
+            "lr_head":        LR_HEAD,
+            "lr_backbone":    LR_BACKBONE,
+            "warmup_epochs":  WARMUP_EPOCHS,
+            "patience":       PATIENCE,
+            "loss":           "AsymmetricLoss",
+            "gamma_neg":      4,
+            "gamma_pos":      0,
+            "clip":           0.05,
+            "optimizer":      "AdamW",
+            "weight_decay":   1e-4,
+            "device":         str(device),
+            "num_classes":    NUM_CLASSES,
+        }
+    )
+    print(f"wandb run: {run.url}")
+    print(f"Device: {device}  |  Input size: {IMG_SIZE}x{IMG_SIZE}")
 
     # ── datasets
     train_ds = ChestXrayDataset(args.train_csv, args.img_dir,
@@ -198,13 +199,12 @@ def train(args):
 
     # ── model
     model = build_model(NUM_CLASSES).to(device)
-    freeze_backbone(model)          # Phase 1: head only
+    wandb.watch(model, log="gradients", log_freq=200)   # track gradients
+    freeze_backbone(model)
     print("Phase 1: training head only (epochs 1-3)")
 
-    # ── loss
+    # ── loss & optimizer
     criterion = AsymmetricLoss(gamma_neg=4, gamma_pos=0, clip=0.05)
-
-    # ── optimizer (head only initially)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=LR_HEAD, weight_decay=1e-4
@@ -214,28 +214,33 @@ def train(args):
                                len(train_loader))
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    best_auc    = 0.0
-    no_improve  = 0
-    log_rows    = []
+    best_auc   = 0.0
+    no_improve = 0
+    log_rows   = []
 
     for epoch in range(1, NUM_EPOCHS + 1):
+
         # ── Phase 2: unfreeze backbone at epoch 4
         if epoch == 4:
             print("\nPhase 2: unfreezing full backbone")
             unfreeze_backbone(model)
             optimizer = torch.optim.AdamW([
-                {"params": model.features.parameters(), "lr": LR_BACKBONE},
-                {"params": model.classifier.parameters(), "lr": LR_HEAD}
+                {"params": model.features.parameters(),    "lr": LR_BACKBONE},
+                {"params": model.classifier.parameters(),  "lr": LR_HEAD}
             ], weight_decay=1e-4)
             scaler    = GradScaler('cuda')
             scheduler = get_scheduler(optimizer, 1, NUM_EPOCHS - epoch + 1,
                                       len(train_loader))
+            wandb.log({"phase": 2, "epoch": epoch})
 
-        # ── train
+        # ── train one epoch
         model.train()
-        train_loss = 0.0
-        t0 = time.time()
-        for imgs, lbs in tqdm(train_loader, desc="Train", leave=False):
+        train_loss   = 0.0
+        t0           = time.time()
+        step_global  = (epoch - 1) * len(train_loader)
+
+        for step, (imgs, lbs) in enumerate(tqdm(train_loader,
+                                                 desc="Train", leave=False)):
             imgs, lbs = imgs.to(device), lbs.to(device)
             optimizer.zero_grad()
             with autocast('cuda'):
@@ -248,6 +253,15 @@ def train(args):
             scaler.update()
             scheduler.step()
             train_loss += loss.item()
+
+            # log batch loss every 100 steps
+            if step % 100 == 0:
+                current_lr = scheduler.get_last_lr()[0]
+                wandb.log({
+                    "batch/train_loss": loss.item(),
+                    "batch/lr":         current_lr,
+                    "batch/step":       step_global + step,
+                })
 
         avg_train_loss = train_loss / len(train_loader)
 
@@ -265,8 +279,22 @@ def train(args):
             torch.save({"epoch": epoch, "model_state": model.state_dict(),
                         "auc": best_auc}, ckpt_path)
             marker = f"\n    ✓ Saved checkpoint → {ckpt_path}"
+            wandb.run.summary["best_val_auc"]   = best_auc
+            wandb.run.summary["best_epoch"]     = epoch
         else:
             no_improve += 1
+
+        # ── log epoch metrics to wandb
+        epoch_log = {
+            "epoch":            epoch,
+            "train/loss":       avg_train_loss,
+            "val/loss":         val_loss,
+            "val/mean_auc":     val_auc,
+            "val/best_auc":     best_auc,
+            "train/epoch_time": elapsed,
+        }
+        epoch_log.update(per_class_aucs)   # individual class AUCs
+        wandb.log(epoch_log)
 
         print(f"  {epoch:>3}  {avg_train_loss:.4f}  {val_loss:.4f}  "
               f"{val_auc:.4f}  {best_auc:.4f}  [{elapsed}s]{marker}")
@@ -277,16 +305,25 @@ def train(args):
         })
 
         if no_improve >= PATIENCE:
-            print(f"\nEarly stopping at epoch {epoch} (no improvement for {PATIENCE} epochs)")
+            print(f"\nEarly stopping at epoch {epoch} "
+                  f"(no improvement for {PATIENCE} epochs)")
             break
 
-    # ── save training log
+    # ── save training log CSV
     import csv
     log_path = os.path.join(args.checkpoint_dir, "densenet121_training_log.csv")
     with open(log_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=log_rows[0].keys())
         writer.writeheader()
         writer.writerows(log_rows)
+
+    # ── upload log CSV and best checkpoint as wandb artifacts
+    artifact = wandb.Artifact("medvision-densenet121", type="model")
+    artifact.add_file(os.path.join(args.checkpoint_dir, "densenet121_best.pth"))
+    artifact.add_file(log_path)
+    wandb.log_artifact(artifact)
+
+    wandb.finish()
     print(f"\nTraining log saved → {log_path}")
     print(f"Best Val AUC: {best_auc:.4f}")
 
