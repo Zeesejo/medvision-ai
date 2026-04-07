@@ -95,8 +95,13 @@ class ChestXrayDataset(Dataset):
         return img, self.labels[idx]
 
     def get_class_weights(self):
-        """Return inverse-frequency weights per class for weighted sampling."""
+        """Return normalized inverse-frequency weights per class.
+
+        FIX L1-004: Raw neg/(pos+eps) ratios can be extremely large for rare
+        classes (e.g. Hernia), destabilizing BCEWithLogitsLoss and
+        WeightedRandomSampler. Normalize to mean=1 for stable training.
+        """
         pos = self.labels.sum(axis=0)
         neg = len(self.labels) - pos
         weights = neg / (pos + 1e-6)
-        return weights
+        return weights / weights.mean()  # normalize to mean=1

@@ -87,7 +87,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler, device, use_amp, gr
         imgs, labels = imgs.to(device), labels.to(device)
         optimizer.zero_grad()
 
-        with autocast(device_type='cuda', enabled=use_amp):
+        with autocast(device_type=device, enabled=use_amp):
             logits = model(imgs)
             loss   = criterion(logits, labels)
 
@@ -114,7 +114,7 @@ def evaluate(model, loader, criterion, device, use_amp, class_names):
 
     for imgs, labels in tqdm(loader, desc='  Eval ', leave=False):
         imgs, labels = imgs.to(device), labels.to(device)
-        with autocast(device_type='cuda', enabled=use_amp):
+        with autocast(device_type=device, enabled=use_amp):
             logits = model(imgs)
             loss   = criterion(logits, labels)
         total_loss += loss.item()
@@ -189,7 +189,11 @@ def main():
     else:
         scheduler = None
 
-    scaler    = GradScaler('cuda', enabled=cfg['training']['amp'])
+    # FIX L1-003: GradScaler must use dynamic device, not hardcoded 'cuda'.
+    # Also disable AMP if not on CUDA to prevent ValueError on CPU machines.
+    use_amp = cfg['training']['amp'] and device == 'cuda'
+    scaler  = GradScaler(device, enabled=use_amp)
+
     save_dir  = Path(cfg['logging']['save_dir'])
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -207,11 +211,11 @@ def main():
 
         train_loss = train_epoch(
             model, loaders['train'], optimizer, criterion,
-            scaler, device, cfg['training']['amp'], cfg['training']['grad_clip']
+            scaler, device, use_amp, cfg['training']['grad_clip']
         )
         val_loss, val_aucs = evaluate(
             model, loaders['val'], criterion, device,
-            cfg['training']['amp'], class_names
+            use_amp, class_names
         )
 
         if scheduler:
@@ -245,7 +249,7 @@ def main():
     print('\nRunning test set evaluation...')
     test_loss, test_aucs = evaluate(
         model, loaders['test'], criterion, device,
-        cfg['training']['amp'], class_names
+        use_amp, class_names
     )
     print(f'\nTest Loss : {test_loss:.4f}')
     print(f'Test AUC  : {test_aucs["mean"]:.4f}')
