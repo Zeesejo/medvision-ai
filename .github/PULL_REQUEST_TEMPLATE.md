@@ -1,18 +1,27 @@
 ## Summary
+Brief description of what this PR does.
 
-<!-- What does this PR do? -->
+## Type of Change
+- [ ] 🐛 Bug fix
+- [ ] 🚀 New feature
+- [ ] 🧪 Experiment / model change
+- [ ] 📝 Documentation
+- [ ] 🔧 Refactor / cleanup
+- [ ] ⚙️ CI / infrastructure
 
-## Type
-- [ ] New experiment script
-- [ ] Model architecture
-- [ ] Dataset / preprocessing
-- [ ] UI feature
-- [ ] Paper draft update
-- [ ] Bug fix
-- [ ] Documentation
+## Changes Made
+- 
+- 
+
+## Testing
+- [ ] Ran `python src/train.py` successfully
+- [ ] Ran `python src/evaluate.py` successfully
+- [ ] No regressions on existing tests
+
+## Related Issues
+Closes #
 
 ## Checklist
-- [ ] Code runs without errors
-- [ ] Docstrings added for new functions/classes
-- [ ] Results logged to wandb (if applicable)
-- [ ] README / docs updated if needed
+- [ ] Code follows project style
+- [ ] Comments added where needed
+- [ ] No secrets or credentials committed

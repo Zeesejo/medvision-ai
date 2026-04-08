@@ -1,0 +1,16 @@
+# Global owner — Zeeshan reviews all PRs
+* @Zeesejo
+
+# Training & evaluation pipeline
+src/train.py @Zeesejo
+src/evaluate.py @Zeesejo
+src/dataset.py @Zeesejo
+
+# Models
+src/models/ @Zeesejo
+
+# XAI
+src/xai/ @Zeesejo
+
+# UI
+ui/ @Zeesejo
