@@ -95,8 +95,8 @@ class ChestXrayDataset(Dataset):
         return img, self.labels[idx]
 
     def get_class_weights(self):
-        """Return inverse-frequency weights per class for weighted sampling."""
+        """Return inverse-frequency weights per class, normalized to mean=1."""
         pos = self.labels.sum(axis=0)
         neg = len(self.labels) - pos
         weights = neg / (pos + 1e-6)
-        return weights
+        return weights / weights.mean()  # L1-004: normalize to mean=1 to prevent loss explosion

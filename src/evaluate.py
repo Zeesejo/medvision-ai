@@ -26,7 +26,7 @@ import matplotlib
 matplotlib.use('Agg')
 from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
 from tqdm import tqdm
-from torch.cuda.amp import autocast
+from torch.amp import autocast  # L1-001: replaced deprecated torch.cuda.amp.autocast
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.models.classifier import build_model
@@ -44,10 +44,10 @@ def run_inference(model, loader, device, use_amp=True):
     all_labels, all_probs = [], []
     for imgs, labels in tqdm(loader, desc='Evaluating'):
         imgs = imgs.to(device)
-        with autocast(enabled=use_amp):
+        with autocast(device_type=device, enabled=use_amp):
             logits = model(imgs)
         all_probs.append(torch.sigmoid(logits).cpu().numpy())
-        all_labels.append(labels.numpy())
+        all_labels.append(labels.cpu().numpy())  # L1-002: explicit .cpu() before .numpy()
     return np.concatenate(all_labels), np.concatenate(all_probs)
 
 
@@ -65,7 +65,12 @@ def compute_aucs(labels, probs):
 
 def plot_roc_curves(labels, probs, save_path='results/roc_curves.png'):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    fig, axes = plt.subplots(3, 5, figsize=(20, 12))
+
+    # L1-005: dynamic grid instead of hardcoded 3x5 (14 classes wasted 1 slot)
+    n = len(CLASS_NAMES)
+    cols = 4
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3))
     axes = axes.flatten()
 
     for i, name in enumerate(CLASS_NAMES):
@@ -84,7 +89,7 @@ def plot_roc_curves(labels, probs, save_path='results/roc_curves.png'):
         axes[i].set_xlim([0,1])
         axes[i].set_ylim([0,1])
 
-    # Hide empty subplot
+    # Hide any remaining empty subplots
     for j in range(len(CLASS_NAMES), len(axes)):
         axes[j].set_visible(False)
 
