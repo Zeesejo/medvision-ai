@@ -1,0 +1,46 @@
+# Label definitions for medvision-ai
+# Apply via: gh label create --from-file .github/labels.yml
+
+- name: bug
+  color: "d73a4a"
+  description: Something isn't working
+
+- name: enhancement
+  color: "a2eeef"
+  description: New feature or request
+
+- name: experiment
+  color: "e4e669"
+  description: Model experiment or ablation study
+
+- name: documentation
+  color: "0075ca"
+  description: Improvements or additions to documentation
+
+- name: good first issue
+  color: "7057ff"
+  description: Good for newcomers
+
+- name: help wanted
+  color: "008672"
+  description: Extra attention is needed
+
+- name: question
+  color: "d876e3"
+  description: Further information is requested
+
+- name: wontfix
+  color: "ffffff"
+  description: This will not be worked on
+
+- name: duplicate
+  color: "cfd3d7"
+  description: This issue or PR already exists
+
+- name: refactor
+  color: "f9d0c4"
+  description: Code restructuring, no behaviour change
+
+- name: ci
+  color: "bfd4f2"
+  description: CI/CD and infrastructure changes
