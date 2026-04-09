@@ -189,7 +189,9 @@ def main():
     else:
         scheduler = None
 
-    scaler    = GradScaler('cuda', enabled=cfg['training']['amp'])
+    # L1-003: tie GradScaler to actual device — prevents crash when running on CPU
+    use_amp = cfg['training']['amp'] and device == 'cuda'
+    scaler    = GradScaler(device, enabled=use_amp)
     save_dir  = Path(cfg['logging']['save_dir'])
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -207,11 +209,11 @@ def main():
 
         train_loss = train_epoch(
             model, loaders['train'], optimizer, criterion,
-            scaler, device, cfg['training']['amp'], cfg['training']['grad_clip']
+            scaler, device, use_amp, cfg['training']['grad_clip']
         )
         val_loss, val_aucs = evaluate(
             model, loaders['val'], criterion, device,
-            cfg['training']['amp'], class_names
+            use_amp, class_names
         )
 
         if scheduler:
@@ -245,7 +247,7 @@ def main():
     print('\nRunning test set evaluation...')
     test_loss, test_aucs = evaluate(
         model, loaders['test'], criterion, device,
-        cfg['training']['amp'], class_names
+        use_amp, class_names
     )
     print(f'\nTest Loss : {test_loss:.4f}')
     print(f'Test AUC  : {test_aucs["mean"]:.4f}')
