@@ -1,3 +1,17 @@
+ > [!WARNING]
+> ## ⚠️ Work in Progress — Unpublished Research
+>
+> **This repository contains active, ongoing research for an unpublished academic paper.**
+>
+> - The code, methodology, models, and results are **incomplete and subject to major changes**
+> - The associated paper has **not yet been peer-reviewed or submitted**
+> - **Do not fork, clone, cite, or build upon this work** without explicit written permission from the author
+> - Unauthorized use of this research may constitute academic misconduct
+>
+> 📬 For collaboration or inquiries, contact: **[Zeeshan Modi](https://github.com/Zeesejo)**
+
+---
+
 # 🩺 MedVision AI
 
 > **Medical Computer Vision Research Project**  
