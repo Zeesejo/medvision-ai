@@ -51,8 +51,14 @@ def parse_args():
 # Loss factory
 # ─────────────────────────────────────────
 def build_loss(loss_name: str, pos_weights: torch.Tensor):
+    """
+    Build loss function.
+    pos_weights: normalized inverse-frequency weights from get_class_weights(),
+                 passed directly as pos_weight to BCEWithLogitsLoss.
+    """
     if loss_name == 'bce':
-        return WeightedBCELoss(pos_weights)
+        # Wire normalized class weights into BCEWithLogitsLoss pos_weight
+        return nn.BCEWithLogitsLoss(pos_weight=pos_weights)
     elif loss_name == 'focal':
         return FocalLoss(gamma=2.0)
     elif loss_name == 'asl':
@@ -87,7 +93,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler, device, use_amp, gr
         imgs, labels = imgs.to(device), labels.to(device)
         optimizer.zero_grad()
 
-        with autocast(device_type='cuda', enabled=use_amp):
+        with autocast(device_type=device, enabled=use_amp):
             logits = model(imgs)
             loss   = criterion(logits, labels)
 
@@ -114,7 +120,7 @@ def evaluate(model, loader, criterion, device, use_amp, class_names):
 
     for imgs, labels in tqdm(loader, desc='  Eval ', leave=False):
         imgs, labels = imgs.to(device), labels.to(device)
-        with autocast(device_type='cuda', enabled=use_amp):
+        with autocast(device_type=device, enabled=use_amp):
             logits = model(imgs)
             loss   = criterion(logits, labels)
         total_loss += loss.item()
@@ -144,6 +150,7 @@ def main():
 
     # ── Device ──
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    use_amp = cfg['training']['amp'] and device == 'cuda'
     print(f'\nDevice : {device}')
     if device == 'cuda':
         print(f'GPU    : {torch.cuda.get_device_name(0)}')
@@ -161,6 +168,11 @@ def main():
     )
     class_names = loaders['class_names']
 
+    # ── Class weights ──  (normalized inverse-freq, wired into BCEWithLogitsLoss)
+    train_dataset = loaders['train'].dataset
+    pos_weights = train_dataset.get_class_weights().to(device)
+    print(f'Class weights (mean={pos_weights.mean():.3f}): {pos_weights.tolist()}')
+
     # ── Model ──
     model = build_model(
         backbone        = cfg['model']['backbone'],
@@ -170,8 +182,8 @@ def main():
         device          = device,
     )
 
-    # ── Loss ──
-    criterion = build_loss(cfg['training']['loss'], loaders['pos_weights'].to(device))
+    # ── Loss ──  (pos_weights now active for BCE; focal/asl ignore it by design)
+    criterion = build_loss(cfg['training']['loss'], pos_weights)
 
     # ── Optimiser ──
     optimizer = torch.optim.AdamW(
@@ -189,7 +201,8 @@ def main():
     else:
         scheduler = None
 
-    scaler    = GradScaler('cuda', enabled=cfg['training']['amp'])
+    # GradScaler: only enable on CUDA, use dynamic device
+    scaler    = GradScaler(device, enabled=use_amp)
     save_dir  = Path(cfg['logging']['save_dir'])
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -207,11 +220,11 @@ def main():
 
         train_loss = train_epoch(
             model, loaders['train'], optimizer, criterion,
-            scaler, device, cfg['training']['amp'], cfg['training']['grad_clip']
+            scaler, device, use_amp, cfg['training']['grad_clip']
         )
         val_loss, val_aucs = evaluate(
             model, loaders['val'], criterion, device,
-            cfg['training']['amp'], class_names
+            use_amp, class_names
         )
 
         if scheduler:
@@ -245,7 +258,7 @@ def main():
     print('\nRunning test set evaluation...')
     test_loss, test_aucs = evaluate(
         model, loaders['test'], criterion, device,
-        cfg['training']['amp'], class_names
+        use_amp, class_names
     )
     print(f'\nTest Loss : {test_loss:.4f}')
     print(f'Test AUC  : {test_aucs["mean"]:.4f}')

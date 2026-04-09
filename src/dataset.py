@@ -15,6 +15,7 @@ import pandas as pd
 import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
+import torch
 
 CLASSES = [
     "Atelectasis", "Cardiomegaly", "Effusion", "Infiltration",
@@ -94,9 +95,15 @@ class ChestXrayDataset(Dataset):
 
         return img, self.labels[idx]
 
-    def get_class_weights(self):
-        """Return inverse-frequency weights per class for weighted sampling."""
+    def get_class_weights(self) -> torch.Tensor:
+        """
+        Return inverse-frequency pos_weights per class, normalized to mean=1.
+
+        Suitable for direct use as `pos_weight` in nn.BCEWithLogitsLoss.
+        Normalization prevents loss explosion for rare classes (e.g. Hernia).
+        """
         pos = self.labels.sum(axis=0)
         neg = len(self.labels) - pos
         weights = neg / (pos + 1e-6)
-        return weights
+        weights = weights / weights.mean()  # normalize to mean=1
+        return torch.tensor(weights, dtype=torch.float32)
