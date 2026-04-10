@@ -23,12 +23,12 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.models.classifier import build_model
-from src.models.losses import WeightedBCELoss, FocalLoss, AsymmetricLoss
+from src.losses import get_loss  # fix: was src.models.losses (wrong path), now uses factory
 from src.data.dataset import get_dataloaders
 
 
 # ─────────────────────────────────────────
-# Config
+Config
 # ─────────────────────────────────────────
 def load_config(path: str = 'config.yaml') -> dict:
     with open(path) as f:
@@ -42,26 +42,13 @@ def parse_args():
     parser.add_argument('--epochs',   type=int, default=None)
     parser.add_argument('--lr',       type=float, default=None)
     parser.add_argument('--batch',    type=int, default=None)
-    parser.add_argument('--loss',     default=None, choices=['bce', 'focal', 'asl'])
+    parser.add_argument('--loss',     default=None, choices=['bce', 'focal', 'asl', 'asl_optimized'])
     parser.add_argument('--data_dir', default=None)
     return parser.parse_args()
 
 
 # ─────────────────────────────────────────
-# Loss factory
-# ─────────────────────────────────────────
-def build_loss(loss_name: str, pos_weights: torch.Tensor):
-    if loss_name == 'bce':
-        return WeightedBCELoss(pos_weights)
-    elif loss_name == 'focal':
-        return FocalLoss(gamma=2.0)
-    elif loss_name == 'asl':
-        return AsymmetricLoss(gamma_neg=4, gamma_pos=0, clip=0.05)
-    raise ValueError(f'Unknown loss: {loss_name}')
-
-
-# ─────────────────────────────────────────
-# AUC metric
+AUC metric
 # ─────────────────────────────────────────
 def compute_auc(all_labels: np.ndarray, all_probs: np.ndarray, class_names: list) -> dict:
     aucs = {}
@@ -76,7 +63,7 @@ def compute_auc(all_labels: np.ndarray, all_probs: np.ndarray, class_names: list
 
 
 # ─────────────────────────────────────────
-# Train one epoch
+Train one epoch
 # ─────────────────────────────────────────
 def train_epoch(model, loader, optimizer, criterion, scaler, device, use_amp, grad_clip):
     model.train()
@@ -87,7 +74,8 @@ def train_epoch(model, loader, optimizer, criterion, scaler, device, use_amp, gr
         imgs, labels = imgs.to(device), labels.to(device)
         optimizer.zero_grad()
 
-        with autocast(device_type='cuda', enabled=use_amp):
+        # fix: use dynamic device_type instead of hardcoded 'cuda'
+        with autocast(device_type=device, enabled=use_amp):
             logits = model(imgs)
             loss   = criterion(logits, labels)
 
@@ -104,7 +92,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler, device, use_amp, gr
 
 
 # ─────────────────────────────────────────
-# Evaluate
+Evaluate
 # ─────────────────────────────────────────
 @torch.no_grad()
 def evaluate(model, loader, criterion, device, use_amp, class_names):
@@ -114,7 +102,7 @@ def evaluate(model, loader, criterion, device, use_amp, class_names):
 
     for imgs, labels in tqdm(loader, desc='  Eval ', leave=False):
         imgs, labels = imgs.to(device), labels.to(device)
-        with autocast(device_type='cuda', enabled=use_amp):
+        with autocast(device_type=device, enabled=use_amp):
             logits = model(imgs)
             loss   = criterion(logits, labels)
         total_loss += loss.item()
@@ -128,11 +116,11 @@ def evaluate(model, loader, criterion, device, use_amp, class_names):
 
 
 # ─────────────────────────────────────────
-# Main
+Main
 # ─────────────────────────────────────────
 def main():
-    args   = parse_args()
-    cfg    = load_config(args.config)
+    args = parse_args()
+    cfg  = load_config(args.config)
 
     # CLI overrides
     if args.backbone: cfg['model']['backbone']         = args.backbone
@@ -170,8 +158,8 @@ def main():
         device          = device,
     )
 
-    # ── Loss ──
-    criterion = build_loss(cfg['training']['loss'], loaders['pos_weights'].to(device))
+    # ── Loss ── (fix: use get_loss() factory — supports asl, asl_optimized, label_smoothing)
+    criterion = get_loss(cfg)
 
     # ── Optimiser ──
     optimizer = torch.optim.AdamW(
@@ -189,10 +177,11 @@ def main():
     else:
         scheduler = None
 
-    # L1-003: tie GradScaler to actual device — prevents crash when running on CPU
+    # ── AMP + Scaler ──
     use_amp = cfg['training']['amp'] and device == 'cuda'
-    scaler    = GradScaler(device, enabled=use_amp)
-    save_dir  = Path(cfg['logging']['save_dir'])
+    scaler  = GradScaler(device, enabled=use_amp)
+
+    save_dir = Path(cfg['logging']['save_dir'])
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Training loop ──
@@ -223,18 +212,17 @@ def main():
         elapsed  = time.time() - t0
         print(f'{epoch:>6} {train_loss:>12.4f} {val_loss:>10.4f} {mean_auc:>10.4f} {best_auc:>10.4f}  [{elapsed:.0f}s]')
 
-        # ── Save best checkpoint ──
         if mean_auc > best_auc:
             best_auc = mean_auc
             patience_count = 0
             ckpt_path = save_dir / f'{cfg["model"]["backbone"]}_best.pth'
             torch.save({
-                'epoch':            epoch,
-                'model_state_dict': model.state_dict(),
+                'epoch':               epoch,
+                'model_state_dict':    model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_auc':          mean_auc,
-                'val_aucs':         val_aucs,
-                'config':           cfg,
+                'val_auc':             mean_auc,
+                'val_aucs':            val_aucs,
+                'config':              cfg,
             }, ckpt_path)
             print(f'         ✓ Saved checkpoint → {ckpt_path}')
         else:

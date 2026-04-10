@@ -40,11 +40,19 @@ def load_config(path='config.yaml'):
 
 @torch.no_grad()
 def run_inference(model, loader, device, use_amp=True):
+    """
+    Run inference over loader and return (labels, probs) as numpy arrays.
+
+    fix: autocast device_type is now gated to 'cuda' only — avoids
+    ValueError on CPU where autocast device_type='cpu' behaves differently
+    across PyTorch versions.
+    """
     model.eval()
     all_labels, all_probs = [], []
+    amp_device = 'cuda' if device == 'cuda' else 'cpu'
     for imgs, labels in tqdm(loader, desc='Evaluating'):
         imgs = imgs.to(device)
-        with autocast(device_type=device, enabled=use_amp):
+        with autocast(device_type=amp_device, enabled=(use_amp and device == 'cuda')):
             logits = model(imgs)
         all_probs.append(torch.sigmoid(logits).cpu().numpy())
         all_labels.append(labels.cpu().numpy())  # L1-002: explicit .cpu() before .numpy()
@@ -89,7 +97,6 @@ def plot_roc_curves(labels, probs, save_path='results/roc_curves.png'):
         axes[i].set_xlim([0,1])
         axes[i].set_ylim([0,1])
 
-    # Hide any remaining empty subplots
     for j in range(len(CLASS_NAMES), len(axes)):
         axes[j].set_visible(False)
 
@@ -122,7 +129,6 @@ def main():
     cfg    = load_config(args.config)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # ---- Load model ----
     ckpt_path = args.checkpoint or str(
         Path(cfg['logging']['save_dir']) / f"{cfg['model']['backbone']}_best.pth"
     )
@@ -133,7 +139,6 @@ def main():
         device          = device,
     )
 
-    # ---- Load test data ----
     loaders = get_dataloaders(
         data_dir    = cfg['data']['data_dir'],
         image_size  = cfg['data']['image_size'],
@@ -144,14 +149,11 @@ def main():
         test_list   = cfg['data']['test_list'],
     )
 
-    # ---- Inference ----
-    labels, probs = run_inference(model, loaders['test'], device)
+    use_amp = cfg['training']['amp']
+    labels, probs = run_inference(model, loaders['test'], device, use_amp)
 
-    # ---- AUC table ----
     aucs = compute_aucs(labels, probs)
     print_auc_table(aucs)
-
-    # ---- ROC curves ----
     plot_roc_curves(labels, probs)
 
     print('\nEvaluation complete!')
