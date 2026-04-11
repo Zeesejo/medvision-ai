@@ -1,13 +1,18 @@
 """
 dataset.py  —  NIH ChestX-ray14 multi-label dataset
 =====================================================
-Expects a CSV with columns:
-  Image Index  |  Finding Labels  (pipe-separated, e.g. "Atelectasis|Effusion")
+Accepts two CSV formats:
 
-img_dir can be either:
-  - a flat directory containing all .png files directly, OR
-  - a root directory containing subdirectories (e.g. images_001 ... images_012)
-    in which case images are located recursively.
+  1. Pre-encoded (from scripts/prepare_csv.py):
+     Columns: Image Index | image_path | Atelectasis | Cardiomegaly | …
+     Labels are already 0/1 integers — used directly.
+
+  2. Raw NIH format (Data_Entry_2017.csv):
+     Columns: Image Index | Finding Labels (pipe-separated) | …
+     Labels are parsed from the pipe-separated string.
+
+img_dir is only used as a fallback when image_path is not in the CSV.
+It can be a flat directory or a root containing images_001…images_012.
 """
 
 import os
@@ -44,10 +49,12 @@ class ChestXrayDataset(Dataset):
     Parameters
     ----------
     csv_path : str
-        Path to CSV file with columns 'Image Index' and 'Finding Labels'.
+        Path to CSV.  Accepts both the pre-encoded format produced by
+        scripts/prepare_csv.py (one-hot label columns) and the raw NIH
+        Data_Entry_2017.csv format (pipe-separated Finding Labels).
     img_dir  : str
-        Root directory that contains the images, either directly or inside
-        subdirectories such as images_001 … images_012.
+        Root directory for images.  Used for the recursive lookup when
+        image_path is absent from the CSV.
     transform : callable, optional
         torchvision transforms applied to each PIL image.
     """
@@ -58,20 +65,41 @@ class ChestXrayDataset(Dataset):
         self.transform = transform
         self.classes   = CLASSES
 
-        # Build a fast filename → path lookup that works for split subfolders
-        print(f"[dataset] Scanning image directory: {img_dir}")
-        self._img_lookup = _build_image_lookup(img_dir)
-        print(f"[dataset] Found {len(self._img_lookup):,} images across all subdirectories.")
+        # ── image path resolution ─────────────────────────────────────────
+        # If the CSV already has an image_path column (from prepare_csv.py),
+        # use it directly and skip the expensive directory scan.
+        if "image_path" in self.df.columns:
+            self._img_lookup = dict(
+                zip(self.df["Image Index"], self.df["image_path"])
+            )
+            print(f"[dataset] Using image_path column from CSV ({len(self._img_lookup):,} entries).")
+        else:
+            print(f"[dataset] Scanning image directory: {img_dir}")
+            self._img_lookup = _build_image_lookup(img_dir)
+            print(f"[dataset] Found {len(self._img_lookup):,} images across all subdirectories.")
 
-        # Pre-compute binary label vectors
+        # ── label encoding ────────────────────────────────────────────────
         self.labels = np.zeros((len(self.df), len(CLASSES)), dtype=np.float32)
-        for i, findings in enumerate(self.df["Finding Labels"]):
-            if pd.isna(findings) or findings == "No Finding":
-                continue
-            for label in str(findings).split("|"):
-                label = label.strip()
-                if label in CLASS2IDX:
-                    self.labels[i, CLASS2IDX[label]] = 1.0
+
+        # Format 1: one-hot columns already present (prepare_csv.py output)
+        if all(c in self.df.columns for c in CLASSES):
+            self.labels = self.df[CLASSES].values.astype(np.float32)
+
+        # Format 2: raw pipe-separated Finding Labels column
+        elif "Finding Labels" in self.df.columns:
+            for i, findings in enumerate(self.df["Finding Labels"]):
+                if pd.isna(findings) or findings == "No Finding":
+                    continue
+                for label in str(findings).split("|"):
+                    label = label.strip()
+                    if label in CLASS2IDX:
+                        self.labels[i, CLASS2IDX[label]] = 1.0
+
+        else:
+            raise ValueError(
+                f"CSV '{csv_path}' has neither one-hot class columns nor a "
+                "'Finding Labels' column.  Run scripts/prepare_csv.py first."
+            )
 
     def __len__(self) -> int:
         return len(self.df)
@@ -79,11 +107,10 @@ class ChestXrayDataset(Dataset):
     def __getitem__(self, idx):
         img_name = self.df.iloc[idx]["Image Index"]
 
-        # Resolve path via lookup dict (handles subdirectories)
         img_path = self._img_lookup.get(img_name)
         if img_path is None:
             raise FileNotFoundError(
-                f"Image '{img_name}' not found under '{self.img_dir}'. "
+                f"Image '{img_name}' not found. "
                 "Check that img_dir points to the archive root containing "
                 "images_001 … images_012 subdirectories."
             )
@@ -99,4 +126,4 @@ class ChestXrayDataset(Dataset):
         pos = self.labels.sum(axis=0)
         neg = len(self.labels) - pos
         weights = neg / (pos + 1e-6)
-        return weights / weights.mean()  # L1-004: normalize to mean=1 to prevent loss explosion
+        return weights / weights.mean()
