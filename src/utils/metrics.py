@@ -1,6 +1,6 @@
 """Evaluation metrics for multi-label classification."""
 
-from typing import Dict
+from typing import Dict, List
 import numpy as np
 from sklearn.metrics import (
     roc_auc_score,
@@ -9,22 +9,31 @@ from sklearn.metrics import (
     hamming_loss,
 )
 
+# Single source of truth for class names - fixes broken deferred import
+# from non-existent src.data.chestxray module
+from src.models.classifier import CLASS_NAMES
 
-def compute_auc(targets: np.ndarray, probs: np.ndarray) -> Dict[str, float]:
+
+def compute_auc(
+    targets: np.ndarray,
+    probs: np.ndarray,
+    class_names: List[str] = None,
+) -> Dict[str, float]:
     """Compute per-class and mean AUC-ROC.
 
     Args:
-        targets: (N, C) binary ground-truth labels
-        probs:   (N, C) predicted probabilities
+        targets     : (N, C) binary ground-truth labels
+        probs       : (N, C) predicted probabilities
+        class_names : list of class names; defaults to CLASS_NAMES
 
     Returns:
         Dict with per-class AUCs and 'mean_auc'
     """
-    from src.data.chestxray import CLASS_NAMES
+    if class_names is None:
+        class_names = CLASS_NAMES
 
     aucs = {}
-    for i, cls in enumerate(CLASS_NAMES):
-        # Skip classes with only one label present in this batch
+    for i, cls in enumerate(class_names):
         if len(np.unique(targets[:, i])) < 2:
             aucs[cls] = float("nan")
         else:
@@ -35,25 +44,30 @@ def compute_auc(targets: np.ndarray, probs: np.ndarray) -> Dict[str, float]:
     return aucs
 
 
-def compute_metrics(targets: np.ndarray, probs: np.ndarray, threshold: float = 0.5) -> Dict[str, float]:
+def compute_metrics(
+    targets: np.ndarray,
+    probs: np.ndarray,
+    threshold: float = 0.5,
+    class_names: List[str] = None,
+) -> Dict[str, float]:
     """Compute a full suite of multi-label metrics.
 
     Args:
-        targets:   (N, C) binary ground-truth labels
-        probs:     (N, C) predicted probabilities
-        threshold: Decision threshold for binary predictions
+        targets     : (N, C) binary ground-truth labels
+        probs       : (N, C) predicted probabilities
+        threshold   : decision threshold for binary predictions
+        class_names : list of class names; defaults to CLASS_NAMES
 
     Returns:
         Dict with mean_auc, mean_ap, macro_f1, micro_f1, hamming_loss
     """
-    preds = (probs >= threshold).astype(int)
-
-    auc_dict = compute_auc(targets, probs)
+    preds    = (probs >= threshold).astype(int)
+    auc_dict = compute_auc(targets, probs, class_names=class_names)
 
     return {
-        "mean_auc":    auc_dict["mean_auc"],
-        "mean_ap":     float(average_precision_score(targets, probs, average="macro")),
-        "macro_f1":    float(f1_score(targets, preds, average="macro",  zero_division=0)),
-        "micro_f1":    float(f1_score(targets, preds, average="micro",  zero_division=0)),
+        "mean_auc":     auc_dict["mean_auc"],
+        "mean_ap":      float(average_precision_score(targets, probs, average="macro")),
+        "macro_f1":     float(f1_score(targets, preds, average="macro",  zero_division=0)),
+        "micro_f1":     float(f1_score(targets, preds, average="micro",  zero_division=0)),
         "hamming_loss": float(hamming_loss(targets, preds)),
     }
