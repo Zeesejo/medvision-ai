@@ -3,7 +3,7 @@ train_v3.py  —  MedVision-AI  (v3 — production-ready)
 =======================================================
 Fixes over train_v2.py:
   [BUG-1]  GradScaler(device.type, ...) → GradScaler(enabled=use_amp)       (PyTorch >=2.3)
-  [BUG-2]  Phase-2 scheduler off-by-one → NUM_EPOCHS - epoch (not +1)
+  [BUG-2]  Phase-2 scheduler off-by-one → NUM_EPOCHS - epoch + 1 (includes current epoch)
   [BUG-3]  log_rows IndexError crash when training aborts before epoch 1
   [BUG-4]  WB_ENTITY=None → now --wb_entity argparse param
   [BUG-5]  num_workers=4 hardcoded → now --num_workers argparse param
@@ -16,9 +16,6 @@ Upgrades over train_v2.py:
   * AsymmetricLossOptimized with fixed log_pos clamp (see losses.py fix)
   * Per-class AUC printed + logged every epoch (not just mean)
   * W&B artifact upload is skipped gracefully if best checkpoint not yet saved
-  * VSCode launch.json written to .vscode/ automatically on first run
-
-Expected AUC gain over baseline ResNet-50: +0.05 - 0.09
 """
 
 import os
@@ -64,23 +61,20 @@ WB_PROJECT    = "medvision-ai"
 
 
 # ── anatomy-aware augmentation ────────────────────────────────────────────────
-# Lung region is typically in the centre-bottom 70% of a chest X-ray.
-# RandomResizedCrop with a biased ratio keeps lung fields in view more often
-# than uniform random crop, improving rare-disease detection on small structures.
 train_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE + 40, IMG_SIZE + 40)),
     transforms.RandomResizedCrop(
         IMG_SIZE,
-        scale=(0.70, 1.00),    # keep ≥70% of original area (avoids clipping lungs)
-        ratio=(0.90, 1.10),    # mild aspect-ratio jitter (CXRs are nearly square)
+        scale=(0.70, 1.00),
+        ratio=(0.90, 1.10),
     ),
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(8),
     transforms.ColorJitter(brightness=0.2, contrast=0.2),
-    transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5)),  # mimic scanner blur
+    transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    transforms.RandomErasing(p=0.1, scale=(0.02, 0.08)),  # CutOut regulariser
+    transforms.RandomErasing(p=0.1, scale=(0.02, 0.08)),
 ])
 
 val_transform = transforms.Compose([
@@ -109,8 +103,8 @@ def get_scheduler(optimizer, warmup_epochs, total_epochs, steps_per_epoch):
 # ── evaluation ────────────────────────────────────────────────────────────────
 def evaluate(model, loader, criterion, device, use_amp=True):
     """
-    Validation pass. AMP is CUDA-only (no-op on CPU).
-    Returns (avg_loss, mean_auc, per_class_auc_dict).
+    Validation pass. Returns (avg_loss, mean_auc, per_class_auc_dict).
+    Returns (0.0, 0.0, {}) immediately if the loader yields no batches.
     """
     amp_enabled = use_amp and device.type == "cuda"
     model.eval()
@@ -126,11 +120,16 @@ def evaluate(model, loader, criterion, device, use_amp=True):
             preds_list.append(torch.sigmoid(logits).cpu().numpy())
             labels_list.append(lbs.cpu().numpy())
 
+    # Copilot review: guard against empty validation loader
+    if not preds_list:
+        return 0.0, 0.0, {}
+
     preds  = np.concatenate(preds_list)
     labels = np.concatenate(labels_list)
     aucs, per_class = [], {}
     for i, cls in enumerate(CLASSES):
-        if labels[:, i].sum() > 0:
+        # Copilot review: guard against single-class columns (all-0 or all-1)
+        if len(np.unique(labels[:, i])) > 1:
             auc = roc_auc_score(labels[:, i], preds[:, i])
             aucs.append(auc)
             per_class[f"val_auc/{cls}"] = auc
@@ -141,12 +140,12 @@ def evaluate(model, loader, criterion, device, use_amp=True):
 # ── training loop ─────────────────────────────────────────────────────────────
 def train(args):
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = device.type == "cuda"   # AMP is meaningful only on CUDA
+    use_amp = device.type == "cuda"
     pin_mem = device.type == "cuda"   # BUG-6: suppress CPU pin_memory warning
 
     run = wandb.init(
         project=WB_PROJECT,
-        entity=args.wb_entity if args.wb_entity else None,   # BUG-4 fix
+        entity=args.wb_entity if args.wb_entity else None,
         name=f"{args.backbone}-320px-asl-v3",
         config={
             "backbone":      args.backbone,
@@ -177,8 +176,8 @@ def train(args):
     val_ds   = ChestXrayDataset(args.val_csv,   args.img_dir, transform=val_transform)
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=args.num_workers,   # BUG-5 fix
-        pin_memory=pin_mem,             # BUG-6 fix
+        num_workers=args.num_workers,
+        pin_memory=pin_mem,
         persistent_workers=(args.num_workers > 0),
     )
     val_loader = DataLoader(
@@ -194,14 +193,12 @@ def train(args):
         num_classes=NUM_CLASSES,
         pretrained=True,
         dropout=0.3,
-        freeze_backbone=True,          # Phase 1: head only
+        freeze_backbone=True,
     ).to(device)
 
-    # Optional: load SSL pre-trained backbone weights
     if args.ssl_checkpoint and os.path.isfile(args.ssl_checkpoint):
         print(f"Loading SSL checkpoint: {args.ssl_checkpoint}")
         ssl_state = torch.load(args.ssl_checkpoint, map_location=device, weights_only=True)
-        # Expect {"backbone": state_dict} or raw state_dict
         bb_state  = ssl_state.get("backbone", ssl_state)
         missing, unexpected = model.backbone.load_state_dict(bb_state, strict=False)
         print(f"  SSL load — missing: {len(missing)}  unexpected: {len(unexpected)}")
@@ -214,7 +211,6 @@ def train(args):
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=LR_HEAD, weight_decay=1e-4,
     )
-    # BUG-1 fix: GradScaler no longer accepts device as positional arg in PyTorch >=2.3
     scaler    = GradScaler(enabled=use_amp)
     scheduler = get_scheduler(optimizer, WARMUP_EPOCHS, NUM_EPOCHS, len(train_loader))
 
@@ -234,9 +230,10 @@ def train(args):
                 ],
                 weight_decay=1e-4,
             )
-            scaler    = GradScaler(enabled=use_amp)   # BUG-1 fix
-            # BUG-2 fix: remaining epochs = NUM_EPOCHS - epoch (was NUM_EPOCHS - epoch + 1)
-            scheduler = get_scheduler(optimizer, 1, NUM_EPOCHS - epoch, len(train_loader))
+            scaler = GradScaler(enabled=use_amp)
+            # Copilot review BUG-2: use NUM_EPOCHS - epoch + 1 to include the
+            # current epoch in the scheduler budget (avoids LR rising at end).
+            scheduler = get_scheduler(optimizer, 1, NUM_EPOCHS - epoch + 1, len(train_loader))
 
         # ── training step ─────────────────────────────────────────────────────
         model.train()
@@ -301,7 +298,6 @@ def train(args):
 
     # ── save training log ────────────────────────────────────────────────────
     log_path = os.path.join(args.checkpoint_dir, f"{args.backbone}_training_log.csv")
-    # BUG-3 fix: guard against empty log_rows (training crashed before epoch 1)
     if log_rows:
         with open(log_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=log_rows[0].keys())
@@ -333,7 +329,7 @@ if __name__ == "__main__":
                         choices=["densenet121", "resnet50", "vit_base_patch16_224"],
                         help="Backbone architecture")
     parser.add_argument("--wb_entity",      default="",
-                        help="Weights & Biases entity / username (e.g. Zeesejo)")
+                        help="Weights & Biases entity / username (e.g. zeemaokik)")
     parser.add_argument("--num_workers",    type=int, default=4,
                         help="DataLoader workers (set 0 on Windows if issues occur)")
     parser.add_argument("--ssl_checkpoint", default="",
