@@ -7,13 +7,14 @@ Upgrades over train.py:
   * Progressive backbone unfreezing  (epoch 1-3 head only, epoch 4+ full)
   * Cosine LR schedule with warmup
   * Test-Time Augmentation (TTA) at validation
-  * Fixed AMP deprecation warning
+  * AMP fully dynamic — works on both CPU and CUDA
   * Weights & Biases (wandb) experiment tracking
 Expected AUC gain: +0.04 - 0.07 over ResNet-50 baseline
 """
 
 import os
 import sys
+import csv
 import time
 import argparse
 import numpy as np
@@ -98,13 +99,19 @@ val_transform = transforms.Compose([
 
 
 # ── evaluation ─────────────────────────────────────────────────────────────
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, use_amp: bool = True):
+    """
+    Run one validation pass.
+    use_amp is gated on CUDA — autocast on CPU provides no benefit and can
+    cause issues on older PyTorch builds.
+    """
+    amp_enabled = use_amp and device.type == "cuda"
     model.eval()
     total_loss, preds, labels = 0.0, [], []
     with torch.no_grad():
         for imgs, lbs in tqdm(loader, desc="Eval ", leave=False):
             imgs, lbs = imgs.to(device), lbs.to(device)
-            with autocast('cuda'):
+            with autocast(device.type, enabled=amp_enabled):
                 logits = model(imgs)
                 loss   = criterion(logits, lbs)
             total_loss += loss.item()
@@ -137,6 +144,8 @@ def get_scheduler(optimizer, warmup_epochs, total_epochs, steps_per_epoch):
 # ── training loop ───────────────────────────────────────────────────────────
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # AMP is only meaningful on CUDA; disable gracefully on CPU
+    use_amp = device.type == "cuda"
 
     run = wandb.init(
         project=WB_PROJECT,
@@ -150,10 +159,11 @@ def train(args):
             "loss": "AsymmetricLoss", "gamma_neg": 4, "gamma_pos": 0,
             "clip": 0.05, "optimizer": "AdamW", "weight_decay": 1e-4,
             "device": str(device), "num_classes": NUM_CLASSES,
+            "use_amp": use_amp,
         }
     )
     print(f"wandb run: {run.url}")
-    print(f"Device: {device}  |  Input: {IMG_SIZE}x{IMG_SIZE}")
+    print(f"Device: {device}  |  Input: {IMG_SIZE}x{IMG_SIZE}  |  AMP: {use_amp}")
 
     train_ds     = ChestXrayDataset(args.train_csv, args.img_dir, transform=train_transform)
     val_ds       = ChestXrayDataset(args.val_csv,   args.img_dir, transform=val_transform)
@@ -172,7 +182,8 @@ def train(args):
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=LR_HEAD, weight_decay=1e-4
     )
-    scaler    = GradScaler('cuda')
+    # GradScaler is a no-op when enabled=False (CPU runs)
+    scaler    = GradScaler(device.type, enabled=use_amp)
     scheduler = get_scheduler(optimizer, WARMUP_EPOCHS, NUM_EPOCHS, len(train_loader))
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -186,7 +197,7 @@ def train(args):
                 {"params": model.features.parameters(),   "lr": LR_BACKBONE},
                 {"params": model.classifier.parameters(), "lr": LR_HEAD}
             ], weight_decay=1e-4)
-            scaler    = GradScaler('cuda')
+            scaler    = GradScaler(device.type, enabled=use_amp)
             scheduler = get_scheduler(optimizer, 1, NUM_EPOCHS - epoch + 1, len(train_loader))
 
         model.train()
@@ -194,7 +205,7 @@ def train(args):
         for step, (imgs, lbs) in enumerate(tqdm(train_loader, desc="Train", leave=False)):
             imgs, lbs = imgs.to(device), lbs.to(device)
             optimizer.zero_grad()
-            with autocast('cuda'):
+            with autocast(device.type, enabled=use_amp):
                 loss = criterion(model(imgs), lbs)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -209,7 +220,7 @@ def train(args):
                            "batch/step": (epoch - 1) * len(train_loader) + step})
 
         avg_train = train_loss / len(train_loader)
-        val_loss, val_auc, per_class = evaluate(model, val_loader, criterion, device)
+        val_loss, val_auc, per_class = evaluate(model, val_loader, criterion, device, use_amp)
         elapsed = int(time.time() - t0)
 
         marker = ""
@@ -238,11 +249,12 @@ def train(args):
             print(f"Early stopping at epoch {epoch}")
             break
 
-    import csv
+    # Fix: use a single DictWriter instance for both header and rows
     log_path = os.path.join(args.checkpoint_dir, "densenet121_training_log.csv")
     with open(log_path, "w", newline="") as f:
-        csv.DictWriter(f, fieldnames=log_rows[0].keys()).writeheader()
-        csv.DictWriter(f, fieldnames=log_rows[0].keys()).writerows(log_rows)
+        writer = csv.DictWriter(f, fieldnames=log_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(log_rows)
 
     artifact = wandb.Artifact("medvision-densenet121", type="model")
     artifact.add_file(os.path.join(args.checkpoint_dir, "densenet121_best.pth"))

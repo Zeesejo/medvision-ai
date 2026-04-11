@@ -20,6 +20,7 @@ import matplotlib.cm as cm
 import cv2
 from torchvision import transforms, models
 from torch.utils.data import DataLoader
+from torch.amp import autocast
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
@@ -55,7 +56,7 @@ def build_model(num_classes, checkpoint_path, device):
 
 
 def get_gradcam(model, img_tensor, class_idx):
-    """Compute Grad-CAM for a single image and class."""
+    """Compute Grad-CAM for a single image and class index."""
     gradients, activations = [], []
 
     def fwd_hook(m, i, o):
@@ -68,25 +69,33 @@ def get_gradcam(model, img_tensor, class_idx):
     handle_fwd = model.features.denseblock4.register_forward_hook(fwd_hook)
     handle_bwd = model.features.denseblock4.register_full_backward_hook(bwd_hook)
 
-    img_tensor = img_tensor.unsqueeze(0).requires_grad_(True)
-    output     = model(img_tensor)
+    # requires_grad must be set before the forward pass
+    img_tensor = img_tensor.unsqueeze(0)
+    img_tensor.requires_grad_(True)
+    output = model(img_tensor)
     model.zero_grad()
     output[0, class_idx].backward()
 
     handle_fwd.remove()
     handle_bwd.remove()
 
-    grads = gradients[0]          # (1, C, H, W)
-    acts  = activations[0]        # (1, C, H, W)
+    grads   = gradients[0]   # (1, C, H, W)
+    acts    = activations[0] # (1, C, H, W)
     weights = grads.mean(dim=(2, 3), keepdim=True)
-    cam = (weights * acts).sum(dim=1, keepdim=True)
-    cam = torch.relu(cam).squeeze().cpu().numpy()
-    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+    cam     = (weights * acts).sum(dim=1, keepdim=True)
+    cam     = torch.relu(cam).squeeze().cpu().numpy()
+    cam     = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
     return cam
 
 
 def save_gradcam_overlay(original_img_path, cam, save_path, alpha=0.45):
-    img  = cv2.imread(original_img_path)
+    """Overlay Grad-CAM heatmap on the original image and save.
+    Skips silently if the source image cannot be read.
+    """
+    img = cv2.imread(original_img_path)
+    if img is None:
+        print(f"  [warn] Could not read image: {original_img_path} — skipping")
+        return
     img  = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
     heat = cv2.resize(cam, (IMG_SIZE, IMG_SIZE))
     heat = np.uint8(255 * heat)
@@ -96,8 +105,9 @@ def save_gradcam_overlay(original_img_path, cam, save_path, alpha=0.45):
 
 
 def evaluate(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = build_model(len(CLASSES), args.checkpoint, device)
+    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda"  # AMP only meaningful on CUDA
+    model   = build_model(len(CLASSES), args.checkpoint, device)
 
     tfm = transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
@@ -112,7 +122,9 @@ def evaluate(args):
     model.eval()
     with torch.no_grad():
         for imgs, lbs in tqdm(loader, desc="Evaluating"):
-            logits = model(imgs.to(device))
+            # Use AMP on CUDA for consistent speed with training
+            with autocast(device.type, enabled=use_amp):
+                logits = model(imgs.to(device))
             all_preds.append(torch.sigmoid(logits).cpu().numpy())
             all_labels.append(lbs.numpy())
 
@@ -148,19 +160,19 @@ def evaluate(args):
         gradcam_dir = os.path.join(args.output_dir, "gradcam")
         os.makedirs(gradcam_dir, exist_ok=True)
 
-        df_test = pd.read_csv(args.test_csv)
+        df_test   = pd.read_csv(args.test_csv)
         img_paths = df_test["Image Index"].tolist()
 
         for cls_idx, cls_name in enumerate(CLASSES):
             pos_indices = np.where(labels[:, cls_idx] == 1)[0][:args.gradcam_n]
-            cls_dir = os.path.join(gradcam_dir, cls_name)
+            cls_dir     = os.path.join(gradcam_dir, cls_name)
             os.makedirs(cls_dir, exist_ok=True)
             for idx in pos_indices:
-                img_path = os.path.join(args.img_dir, img_paths[idx])
+                img_path   = os.path.join(args.img_dir, img_paths[idx])
                 img_tensor, _ = ds[idx]
                 img_tensor = img_tensor.to(device)
-                cam = get_gradcam(model, img_tensor, cls_idx)
-                save_path = os.path.join(cls_dir, f"sample_{idx}.png")
+                cam        = get_gradcam(model, img_tensor, cls_idx)
+                save_path  = os.path.join(cls_dir, f"sample_{idx}.png")
                 save_gradcam_overlay(img_path, cam, save_path)
         print(f"Grad-CAM heatmaps saved → {gradcam_dir}")
 
