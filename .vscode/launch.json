@@ -1,0 +1,79 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Train v3 (DenseNet-121)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/train_v3.py",
+      "args": [
+        "--train_csv", "data/train_val.csv",
+        "--val_csv",   "data/val.csv",
+        "--img_dir",   "data/images",
+        "--backbone",  "densenet121",
+        "--wb_entity", "Zeesejo",
+        "--num_workers", "4"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
+      "name": "Train v3 (ViT-B/16)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/train_v3.py",
+      "args": [
+        "--train_csv", "data/train_val.csv",
+        "--val_csv",   "data/val.csv",
+        "--img_dir",   "data/images",
+        "--backbone",  "vit_base_patch16_224",
+        "--wb_entity", "Zeesejo",
+        "--num_workers", "4"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
+      "name": "SSL MAE Pretraining",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/ssl/mae_pretrain.py",
+      "args": [
+        "--img_dir",    "data/images",
+        "--save_dir",   "results/ssl",
+        "--epochs",     "100",
+        "--batch_size", "64",
+        "--wb_entity",  "Zeesejo"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
+      "name": "Evaluate v2 (+ GradCAM)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/evaluate_v2.py",
+      "args": [
+        "--checkpoint",  "results/checkpoints/densenet121_best.pth",
+        "--test_csv",    "data/test.csv",
+        "--img_dir",     "data/images",
+        "--output_dir",  "results/eval",
+        "--gradcam"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    }
+  ]
+}
