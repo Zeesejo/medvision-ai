@@ -16,6 +16,7 @@ Upgrades over train_v2.py:
   * AsymmetricLossOptimized with fixed log_pos clamp (see losses.py fix)
   * Per-class AUC printed + logged every epoch (not just mean)
   * W&B artifact upload is skipped gracefully if best checkpoint not yet saved
+  * --resume flag: resume training from any saved checkpoint
 """
 
 import os
@@ -39,10 +40,10 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from src.dataset import ChestXrayDataset
-from src.losses  import AsymmetricLossOptimized          # BUG-4 fixed variant
+from src.losses  import AsymmetricLossOptimized
 from src.models.classifier import build_model as build_timm_model
 
-# ── constants ─────────────────────────────────────────────────────────────────
+# ── constants ───────────────────────────────────────────────────────────────────────────
 CLASSES = [
     "Atelectasis", "Cardiomegaly", "Effusion", "Infiltration",
     "Mass", "Nodule", "Pneumonia", "Pneumothorax",
@@ -60,7 +61,7 @@ PATIENCE      = 8
 WB_PROJECT    = "medvision-ai"
 
 
-# ── anatomy-aware augmentation ────────────────────────────────────────────────
+# ── anatomy-aware augmentation ────────────────────────────────────────────
 train_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE + 40, IMG_SIZE + 40)),
     transforms.RandomResizedCrop(
@@ -84,7 +85,7 @@ val_transform = transforms.Compose([
 ])
 
 
-# ── scheduler ─────────────────────────────────────────────────────────────────
+# ── scheduler ───────────────────────────────────────────────────────────────────
 def get_scheduler(optimizer, warmup_epochs, total_epochs, steps_per_epoch):
     from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
     warmup = LinearLR(
@@ -100,12 +101,8 @@ def get_scheduler(optimizer, warmup_epochs, total_epochs, steps_per_epoch):
     )
 
 
-# ── evaluation ────────────────────────────────────────────────────────────────
+# ── evaluation ───────────────────────────────────────────────────────────────────
 def evaluate(model, loader, criterion, device, use_amp=True):
-    """
-    Validation pass. Returns (avg_loss, mean_auc, per_class_auc_dict).
-    Returns (0.0, 0.0, {}) immediately if the loader yields no batches.
-    """
     amp_enabled = use_amp and device.type == "cuda"
     model.eval()
     total_loss, preds_list, labels_list = 0.0, [], []
@@ -120,7 +117,6 @@ def evaluate(model, loader, criterion, device, use_amp=True):
             preds_list.append(torch.sigmoid(logits).cpu().numpy())
             labels_list.append(lbs.cpu().numpy())
 
-    # Copilot review: guard against empty validation loader
     if not preds_list:
         return 0.0, 0.0, {}
 
@@ -128,7 +124,6 @@ def evaluate(model, loader, criterion, device, use_amp=True):
     labels = np.concatenate(labels_list)
     aucs, per_class = [], {}
     for i, cls in enumerate(CLASSES):
-        # Copilot review: guard against single-class columns (all-0 or all-1)
         if len(np.unique(labels[:, i])) > 1:
             auc = roc_auc_score(labels[:, i], preds[:, i])
             aucs.append(auc)
@@ -137,16 +132,36 @@ def evaluate(model, loader, criterion, device, use_amp=True):
     return total_loss / max(len(loader), 1), mean_auc, per_class
 
 
-# ── training loop ─────────────────────────────────────────────────────────────
+# ── training loop ──────────────────────────────────────────────────────────────────
 def train(args):
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
-    pin_mem = device.type == "cuda"   # BUG-6: suppress CPU pin_memory warning
+    pin_mem = device.type == "cuda"
+
+    # ── load checkpoint if resuming ───────────────────────────────────────────
+    resume_ckpt = None
+    start_epoch = 1
+    best_auc    = 0.0
+    no_improve  = 0
+    log_rows    = []
+
+    if args.resume:
+        ckpt_path = args.resume
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"--resume checkpoint not found: {ckpt_path}")
+        print(f"\nResuming from checkpoint: {ckpt_path}")
+        resume_ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        start_epoch = resume_ckpt.get("epoch", 1) + 1
+        best_auc    = resume_ckpt.get("auc",   0.0)
+        no_improve  = resume_ckpt.get("no_improve", 0)
+        log_rows    = resume_ckpt.get("log_rows",   [])
+        print(f"  Resuming from epoch {start_epoch}  |  best_auc so far: {best_auc:.4f}")
 
     run = wandb.init(
         project=WB_PROJECT,
         entity=args.wb_entity if args.wb_entity else None,
         name=f"{args.backbone}-320px-asl-v3",
+        resume="allow",          # re-attach to the same W&B run if id matches
         config={
             "backbone":      args.backbone,
             "img_size":      IMG_SIZE,
@@ -187,16 +202,25 @@ def train(args):
         persistent_workers=(args.num_workers > 0),
     )
 
-    # ── model ────────────────────────────────────────────────────────────────
+    # ── model ─────────────────────────────────────────────────────────────────────
+    # If resuming from epoch >= 4 the backbone must already be unfrozen
+    # before we load the state dict (so all parameter tensors exist).
+    freeze_for_init = (start_epoch <= 3) and (resume_ckpt is None)
     model = build_timm_model(
         backbone=args.backbone,
         num_classes=NUM_CLASSES,
-        pretrained=True,
+        pretrained=(resume_ckpt is None),   # skip ImageNet weights when resuming
         dropout=0.3,
-        freeze_backbone=True,
+        freeze_backbone=freeze_for_init,
     ).to(device)
 
-    if args.ssl_checkpoint and os.path.isfile(args.ssl_checkpoint):
+    if resume_ckpt is not None:
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        print(f"  Model weights loaded.")
+        if start_epoch > 3:
+            model.unfreeze_backbone()
+            print("  Backbone unfrozen (resuming in Phase 2).")
+    elif args.ssl_checkpoint and os.path.isfile(args.ssl_checkpoint):
         print(f"Loading SSL checkpoint: {args.ssl_checkpoint}")
         ssl_state = torch.load(args.ssl_checkpoint, map_location=device, weights_only=True)
         bb_state  = ssl_state.get("backbone", ssl_state)
@@ -204,23 +228,60 @@ def train(args):
         print(f"  SSL load — missing: {len(missing)}  unexpected: {len(unexpected)}")
 
     wandb.watch(model, log="gradients", log_freq=200)
-    print("Phase 1: head only (epochs 1-3)")
 
     criterion = AsymmetricLossOptimized(gamma_neg=4, gamma_pos=0, clip=0.05)
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=LR_HEAD, weight_decay=1e-4,
-    )
-    scaler    = GradScaler(enabled=use_amp)
-    scheduler = get_scheduler(optimizer, WARMUP_EPOCHS, NUM_EPOCHS, len(train_loader))
+
+    # ── build optimizer & scheduler ────────────────────────────────────────────
+    if start_epoch > 3:
+        # Resuming into Phase 2 — use differential LR
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": model.backbone.parameters(), "lr": LR_BACKBONE},
+                {"params": model.head.parameters(),     "lr": LR_HEAD},
+            ],
+            weight_decay=1e-4,
+        )
+        remaining_epochs = NUM_EPOCHS - start_epoch + 1
+        scheduler = get_scheduler(optimizer, 1, remaining_epochs, len(train_loader))
+    else:
+        # Starting / resuming in Phase 1
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=LR_HEAD, weight_decay=1e-4,
+        )
+        scheduler = get_scheduler(optimizer, WARMUP_EPOCHS, NUM_EPOCHS, len(train_loader))
+
+    scaler = GradScaler(enabled=use_amp)
+
+    # Restore optimizer + scaler + scheduler states if available
+    if resume_ckpt is not None:
+        if "optimizer_state_dict" in resume_ckpt:
+            try:
+                optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+                print("  Optimizer state restored.")
+            except Exception as e:
+                print(f"  Optimizer state skipped ({e}): starting fresh optimizer.")
+        if "scaler_state_dict" in resume_ckpt:
+            scaler.load_state_dict(resume_ckpt["scaler_state_dict"])
+            print("  GradScaler state restored.")
+        if "scheduler_state_dict" in resume_ckpt:
+            try:
+                scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+                print("  Scheduler state restored.")
+            except Exception as e:
+                print(f"  Scheduler state skipped ({e}): starting fresh scheduler.")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    best_auc, no_improve, log_rows = 0.0, 0, []
     best_ckpt_path = os.path.join(args.checkpoint_dir, f"{args.backbone}_best.pth")
 
-    for epoch in range(1, NUM_EPOCHS + 1):
+    if start_epoch <= 3:
+        print("Phase 1: head only (epochs 1-3)")
+    else:
+        print(f"Phase 2: full backbone unfrozen (resuming at epoch {start_epoch})")
+
+    for epoch in range(start_epoch, NUM_EPOCHS + 1):
         # Phase 2: unfreeze full backbone at epoch 4
-        if epoch == 4:
+        if epoch == 4 and start_epoch <= 4:
             print("\nPhase 2: full backbone unfrozen")
             model.unfreeze_backbone()
             optimizer = torch.optim.AdamW(
@@ -231,11 +292,9 @@ def train(args):
                 weight_decay=1e-4,
             )
             scaler = GradScaler(enabled=use_amp)
-            # Copilot review BUG-2: use NUM_EPOCHS - epoch + 1 to include the
-            # current epoch in the scheduler budget (avoids LR rising at end).
             scheduler = get_scheduler(optimizer, 1, NUM_EPOCHS - epoch + 1, len(train_loader))
 
-        # ── training step ─────────────────────────────────────────────────────
+        # ── training step ──────────────────────────────────────────────────────────────
         model.train()
         train_loss, t0 = 0.0, time.time()
         for step, (imgs, lbs) in enumerate(tqdm(train_loader, desc=f"Ep {epoch:02d}", leave=False)):
@@ -265,7 +324,16 @@ def train(args):
         if val_auc > best_auc:
             best_auc, no_improve = val_auc, 0
             torch.save(
-                {"epoch": epoch, "model_state_dict": model.state_dict(), "auc": best_auc},
+                {
+                    "epoch":              epoch,
+                    "model_state_dict":   model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict":  scaler.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "auc":                best_auc,
+                    "no_improve":         no_improve,
+                    "log_rows":           log_rows,
+                },
                 best_ckpt_path,
             )
             marker = f"  ✓ saved → {best_ckpt_path}"
@@ -296,7 +364,7 @@ def train(args):
             print(f"Early stopping at epoch {epoch}.")
             break
 
-    # ── save training log ────────────────────────────────────────────────────
+    # ── save training log ──────────────────────────────────────────────────────────
     log_path = os.path.join(args.checkpoint_dir, f"{args.backbone}_training_log.csv")
     if log_rows:
         with open(log_path, "w", newline="") as f:
@@ -305,7 +373,7 @@ def train(args):
             writer.writerows(log_rows)
         print(f"Training log → {log_path}")
 
-    # ── W&B artifact upload ───────────────────────────────────────────────────
+    # ── W&B artifact upload ─────────────────────────────────────────────────────────
     if os.path.isfile(best_ckpt_path):
         artifact = wandb.Artifact(f"medvision-{args.backbone}", type="model")
         artifact.add_file(best_ckpt_path)
@@ -318,7 +386,7 @@ def train(args):
     return best_auc
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ── entry point ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MedVision-AI v3 trainer")
     parser.add_argument("--train_csv",      default="data/train_val.csv")
@@ -329,9 +397,11 @@ if __name__ == "__main__":
                         choices=["densenet121", "resnet50", "vit_base_patch16_224"],
                         help="Backbone architecture")
     parser.add_argument("--wb_entity",      default="",
-                        help="Weights & Biases entity / username (e.g. zeemaokik)")
+                        help="Weights & Biases entity / username")
     parser.add_argument("--num_workers",    type=int, default=4,
                         help="DataLoader workers (set 0 on Windows if issues occur)")
     parser.add_argument("--ssl_checkpoint", default="",
                         help="Optional path to SSL-pretrained backbone .pth file")
+    parser.add_argument("--resume",         default="",
+                        help="Path to checkpoint .pth to resume training from")
     train(parser.parse_args())
