@@ -1,0 +1,66 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Train v3 (DenseNet-121)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/train_v3.py",
+      "args": [
+        "--train_csv", "data/train_val.csv",
+        "--val_csv",   "data/val.csv",
+        "--img_dir",   "data/images",
+        "--backbone",  "densenet121",
+        "--wb_entity", "zeemaokik",
+        "--num_workers", "0"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Train v3 (ViT-B/16)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/train_v3.py",
+      "args": [
+        "--train_csv", "data/train_val.csv",
+        "--val_csv",   "data/val.csv",
+        "--img_dir",   "data/images",
+        "--backbone",  "vit_base_patch16_224",
+        "--wb_entity", "zeemaokik",
+        "--num_workers", "0"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "SSL Pretrain (MAE)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/ssl_pretrain/mae_pretrain.py",
+      "args": [
+        "--img_dir",    "data/images",
+        "--save_dir",   "results/ssl",
+        "--epochs",     "100",
+        "--batch_size", "32",
+        "--num_workers", "0",
+        "--wb_entity",  "zeemaokik"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Evaluate v2",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/evaluate_v2.py",
+      "args": [
+        "--test_csv",  "data/test.csv",
+        "--img_dir",   "data/images",
+        "--checkpoint", "results/checkpoints/densenet121_best.pth"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}
