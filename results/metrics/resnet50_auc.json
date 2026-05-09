@@ -1,0 +1,20 @@
+{
+  "backbone": "resnet50",
+  "mean_auc": 0.7067,
+  "per_class": {
+    "Atelectasis": 0.5,
+    "Cardiomegaly": 0.8319,
+    "Effusion": 0.5,
+    "Infiltration": 0.5,
+    "Mass": 0.7705,
+    "Nodule": 0.7327,
+    "Pneumonia": 0.6673,
+    "Pneumothorax": 0.7796,
+    "Consolidation": 0.7048,
+    "Edema": 0.8127,
+    "Emphysema": 0.8671,
+    "Fibrosis": 0.6972,
+    "Pleural_Thickening": 0.6782,
+    "Hernia": 0.8512
+  }
+}

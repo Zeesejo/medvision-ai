@@ -1,0 +1,20 @@
+{
+  "backbone": "densenet121",
+  "mean_auc": 0.7978,
+  "per_class": {
+    "Atelectasis": 0.7686,
+    "Cardiomegaly": 0.8689,
+    "Effusion": 0.8136,
+    "Infiltration": 0.6954,
+    "Mass": 0.805,
+    "Nodule": 0.7445,
+    "Pneumonia": 0.7001,
+    "Pneumothorax": 0.8571,
+    "Consolidation": 0.7333,
+    "Edema": 0.8365,
+    "Emphysema": 0.9163,
+    "Fibrosis": 0.7938,
+    "Pleural_Thickening": 0.7453,
+    "Hernia": 0.8907
+  }
+}
