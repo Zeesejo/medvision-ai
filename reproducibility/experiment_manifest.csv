@@ -1,0 +1,3 @@
+run_id,status,date,commit_sha,backbone,loss,pretraining,image_size,batch_size,learning_rate,seed,split_id,checkpoint,predictions,metrics,notes
+historical_densenet121,artifact_only,,,,densenet121,asl,,,,,,,,results/metrics/densenet121_auc.json,"Historical committed result; full run provenance incomplete"
+historical_resnet50,artifact_only,,,,resnet50,asl,,,,,,,,results/metrics/resnet50_auc.json,"Historical committed result; full run provenance incomplete"

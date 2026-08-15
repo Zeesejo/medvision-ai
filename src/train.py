@@ -1,251 +1,364 @@
-"""
-MedVision-AI — Training Script
-================================
-Usage:
-    python src/train.py                        # uses config.yaml defaults
-    python src/train.py --backbone vit_base_patch16_224
-    python src/train.py --epochs 50 --lr 3e-4
+"""Canonical MedVision-AI training and evaluation entry point.
+
+Example:
+    python src/train.py --config configs/baseline_densenet121_asl.yaml
+
+Each run writes a self-contained directory with the resolved config, environment
+snapshot, training history, best checkpoint, test metrics, and raw predictions.
 """
 
-import os
-import sys
+from __future__ import annotations
+
 import argparse
+import csv
+import shutil
 import time
 from pathlib import Path
 
-import yaml
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
+import torchvision.transforms as T
+import yaml
+from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.amp import GradScaler, autocast
-from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from src.constants import CLASS_NAMES
+from src.dataset import ChestXrayDataset
+from src.losses import get_loss
 from src.models.classifier import build_model
-from src.losses import get_loss  # fix: was src.models.losses (wrong path), now uses factory
-from src.data.dataset import get_dataloaders
+from src.reproducibility import environment_snapshot, seed_everything, write_json
 
 
-# ─────────────────────────────────────────
-Config
-# ─────────────────────────────────────────
-def load_config(path: str = 'config.yaml') -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='MedVision-AI Trainer')
-    parser.add_argument('--config',   default='config.yaml')
-    parser.add_argument('--backbone', default=None)
-    parser.add_argument('--epochs',   type=int, default=None)
-    parser.add_argument('--lr',       type=float, default=None)
-    parser.add_argument('--batch',    type=int, default=None)
-    parser.add_argument('--loss',     default=None, choices=['bce', 'focal', 'asl', 'asl_optimized'])
-    parser.add_argument('--data_dir', default=None)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train a reproducible MedVision-AI baseline")
+    parser.add_argument(
+        "--config",
+        default="configs/baseline_densenet121_asl.yaml",
+        help="Experiment YAML configuration",
+    )
+    parser.add_argument("--run_name", default=None, help="Optional output-directory override")
     return parser.parse_args()
 
 
-# ─────────────────────────────────────────
-AUC metric
-# ─────────────────────────────────────────
-def compute_auc(all_labels: np.ndarray, all_probs: np.ndarray, class_names: list) -> dict:
-    aucs = {}
-    for i, name in enumerate(class_names):
-        if len(np.unique(all_labels[:, i])) > 1:
-            aucs[name] = roc_auc_score(all_labels[:, i], all_probs[:, i])
+def load_config(path: str) -> dict:
+    with open(path, encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def build_transforms(image_size: int) -> tuple[T.Compose, T.Compose]:
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    train_transform = T.Compose(
+        [
+            T.Resize((image_size + 32, image_size + 32)),
+            T.RandomCrop(image_size),
+            T.RandomHorizontalFlip(),
+            T.ColorJitter(brightness=0.2, contrast=0.2),
+            T.ToTensor(),
+            T.Normalize(mean, std),
+        ]
+    )
+    eval_transform = T.Compose(
+        [
+            T.Resize((image_size, image_size)),
+            T.ToTensor(),
+            T.Normalize(mean, std),
+        ]
+    )
+    return train_transform, eval_transform
+
+
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+
+
+def build_loaders(cfg: dict, seed: int) -> dict[str, DataLoader]:
+    data_cfg = cfg["data"]
+    train_transform, eval_transform = build_transforms(int(data_cfg["image_size"]))
+
+    datasets = {
+        "train": ChestXrayDataset(data_cfg["train_csv"], data_cfg["img_dir"], transform=train_transform),
+        "val": ChestXrayDataset(data_cfg["val_csv"], data_cfg["img_dir"], transform=eval_transform),
+        "test": ChestXrayDataset(data_cfg["test_csv"], data_cfg["img_dir"], transform=eval_transform),
+    }
+
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    num_workers = int(data_cfg.get("num_workers", 4))
+    pin_memory = torch.cuda.is_available()
+
+    return {
+        split: DataLoader(
+            dataset,
+            batch_size=int(data_cfg.get("batch_size", 32)),
+            shuffle=(split == "train"),
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
+            worker_init_fn=seed_worker,
+            generator=generator,
+        )
+        for split, dataset in datasets.items()
+    }
+
+
+def compute_metrics(labels: np.ndarray, probs: np.ndarray) -> dict:
+    per_class = {}
+    auc_values = []
+    ap_values = []
+
+    for index, class_name in enumerate(CLASS_NAMES):
+        y_true = labels[:, index]
+        y_prob = probs[:, index]
+        if len(np.unique(y_true)) < 2:
+            auc = None
+            ap = None
         else:
-            aucs[name] = float('nan')
-    valid = [v for v in aucs.values() if not np.isnan(v)]
-    aucs['mean'] = np.mean(valid) if valid else 0.0
-    return aucs
+            auc = float(roc_auc_score(y_true, y_prob))
+            ap = float(average_precision_score(y_true, y_prob))
+            auc_values.append(auc)
+            ap_values.append(ap)
+
+        per_class[class_name] = {"auroc": auc, "auprc": ap}
+
+    return {
+        "macro_auroc": float(np.mean(auc_values)) if auc_values else None,
+        "macro_auprc": float(np.mean(ap_values)) if ap_values else None,
+        "per_class": per_class,
+    }
 
 
-# ─────────────────────────────────────────
-Train one epoch
-# ─────────────────────────────────────────
-def train_epoch(model, loader, optimizer, criterion, scaler, device, use_amp, grad_clip):
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    use_amp: bool,
+) -> tuple[float, np.ndarray, np.ndarray, dict]:
+    model.eval()
+    total_loss = 0.0
+    labels_list = []
+    probs_list = []
+
+    for images, labels in tqdm(loader, desc="Eval", leave=False):
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True).float()
+        with autocast(device_type=device.type, enabled=use_amp):
+            logits = model(images)
+            loss = criterion(logits, labels)
+        total_loss += float(loss.item())
+        labels_list.append(labels.cpu().numpy())
+        probs_list.append(torch.sigmoid(logits).cpu().numpy())
+
+    labels_np = np.concatenate(labels_list, axis=0)
+    probs_np = np.concatenate(probs_list, axis=0)
+    metrics = compute_metrics(labels_np, probs_np)
+    return total_loss / max(len(loader), 1), labels_np, probs_np, metrics
+
+
+def train_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    scaler: GradScaler,
+    device: torch.device,
+    use_amp: bool,
+    grad_clip: float,
+) -> float:
     model.train()
     total_loss = 0.0
-    pbar = tqdm(loader, desc='  Train', leave=False)
 
-    for imgs, labels in pbar:
-        imgs, labels = imgs.to(device), labels.to(device)
-        optimizer.zero_grad()
+    for images, labels in tqdm(loader, desc="Train", leave=False):
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True).float()
+        optimizer.zero_grad(set_to_none=True)
 
-        # fix: use dynamic device_type instead of hardcoded 'cuda'
-        with autocast(device_type=device, enabled=use_amp):
-            logits = model(imgs)
-            loss   = criterion(logits, labels)
+        with autocast(device_type=device.type, enabled=use_amp):
+            logits = model(images)
+            loss = criterion(logits, labels)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         scaler.step(optimizer)
         scaler.update()
+        total_loss += float(loss.item())
 
-        total_loss += loss.item()
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-
-    return total_loss / len(loader)
+    return total_loss / max(len(loader), 1)
 
 
-# ─────────────────────────────────────────
-Evaluate
-# ─────────────────────────────────────────
-@torch.no_grad()
-def evaluate(model, loader, criterion, device, use_amp, class_names):
-    model.eval()
-    total_loss = 0.0
-    all_labels, all_probs = [], []
-
-    for imgs, labels in tqdm(loader, desc='  Eval ', leave=False):
-        imgs, labels = imgs.to(device), labels.to(device)
-        with autocast(device_type=device, enabled=use_amp):
-            logits = model(imgs)
-            loss   = criterion(logits, labels)
-        total_loss += loss.item()
-        all_labels.append(labels.cpu().numpy())
-        all_probs.append(torch.sigmoid(logits).cpu().numpy())
-
-    all_labels = np.concatenate(all_labels)
-    all_probs  = np.concatenate(all_probs)
-    aucs = compute_auc(all_labels, all_probs, class_names)
-    return total_loss / len(loader), aucs
+def save_predictions(path: Path, labels: np.ndarray, probs: np.ndarray) -> None:
+    data = {}
+    for index, class_name in enumerate(CLASS_NAMES):
+        data[f"label_{class_name}"] = labels[:, index].astype(np.int8)
+        data[f"prob_{class_name}"] = probs[:, index]
+    pd.DataFrame(data).to_csv(path, index=False)
 
 
-# ─────────────────────────────────────────
-Main
-# ─────────────────────────────────────────
-def main():
+def main() -> None:
     args = parse_args()
-    cfg  = load_config(args.config)
+    cfg = load_config(args.config)
 
-    # CLI overrides
-    if args.backbone: cfg['model']['backbone']         = args.backbone
-    if args.epochs:   cfg['training']['epochs']        = args.epochs
-    if args.lr:       cfg['training']['learning_rate'] = args.lr
-    if args.batch:    cfg['training']['batch_size']    = args.batch
-    if args.loss:     cfg['training']['loss']          = args.loss
-    if args.data_dir: cfg['data']['data_dir']          = args.data_dir
+    seed = int(cfg.get("project", {}).get("seed", 42))
+    deterministic = bool(cfg.get("project", {}).get("deterministic", True))
+    seed_everything(seed, deterministic=deterministic)
 
-    # ── Device ──
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f'\nDevice : {device}')
-    if device == 'cuda':
-        print(f'GPU    : {torch.cuda.get_device_name(0)}')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = bool(cfg["training"].get("amp", True)) and device.type == "cuda"
 
-    # ── Data ──
-    loaders = get_dataloaders(
-        data_dir      = cfg['data']['data_dir'],
-        image_size    = cfg['data']['image_size'],
-        batch_size    = cfg['training']['batch_size'],
-        num_workers   = cfg['data']['num_workers'],
-        images_subdir = cfg['data']['images_subdir'],
-        labels_file   = cfg['data']['labels_file'],
-        train_val_list= cfg['data']['train_val_list'],
-        test_list     = cfg['data']['test_list'],
+    experiment_id = cfg.get("project", {}).get("experiment_id", "experiment")
+    run_name = args.run_name or f"{experiment_id}_seed{seed}"
+    output_dir = Path(cfg["logging"].get("output_root", "results/runs")) / run_name
+    output_dir.mkdir(parents=True, exist_ok=False)
+
+    shutil.copy2(args.config, output_dir / "config.yaml")
+    write_json(output_dir / "environment.json", environment_snapshot())
+    write_json(
+        output_dir / "run_manifest.json",
+        {
+            "experiment_id": experiment_id,
+            "run_name": run_name,
+            "seed": seed,
+            "deterministic": deterministic,
+            "device": str(device),
+            "config_source": str(Path(args.config).resolve()),
+        },
     )
-    class_names = loaders['class_names']
 
-    # ── Model ──
+    loaders = build_loaders(cfg, seed)
     model = build_model(
-        backbone        = cfg['model']['backbone'],
-        pretrained      = cfg['model']['pretrained'],
-        dropout         = cfg['model']['dropout'],
-        freeze_backbone = cfg['model']['freeze_backbone'],
-        device          = device,
+        backbone=cfg["model"]["backbone"],
+        pretrained=bool(cfg["model"].get("pretrained", True)),
+        dropout=float(cfg["model"].get("dropout", 0.3)),
+        freeze_backbone=bool(cfg["model"].get("freeze_backbone", False)),
+        device=str(device),
     )
-
-    # ── Loss ── (fix: use get_loss() factory — supports asl, asl_optimized, label_smoothing)
     criterion = get_loss(cfg)
 
-    # ── Optimiser ──
     optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr           = cfg['training']['learning_rate'],
-        weight_decay = cfg['training']['weight_decay'],
+        filter(lambda parameter: parameter.requires_grad, model.parameters()),
+        lr=float(cfg["training"]["learning_rate"]),
+        weight_decay=float(cfg["training"].get("weight_decay", 0.0)),
     )
 
-    # ── Scheduler ──
-    epochs = cfg['training']['epochs']
-    if cfg['training']['scheduler'] == 'cosine':
+    epochs = int(cfg["training"]["epochs"])
+    scheduler_name = cfg["training"].get("scheduler", "cosine")
+    if scheduler_name == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    elif cfg['training']['scheduler'] == 'step':
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-    else:
+    elif scheduler_name in {None, "none"}:
         scheduler = None
+    else:
+        raise ValueError(f"Unsupported scheduler: {scheduler_name}")
 
-    # ── AMP + Scaler ──
-    use_amp = cfg['training']['amp'] and device == 'cuda'
-    scaler  = GradScaler(device, enabled=use_amp)
+    scaler = GradScaler(device=device.type, enabled=use_amp)
+    patience = int(cfg["training"].get("early_stopping_patience", epochs))
+    grad_clip = float(cfg["training"].get("grad_clip", 1.0))
 
-    save_dir = Path(cfg['logging']['save_dir'])
-    save_dir.mkdir(parents=True, exist_ok=True)
+    best_auc = -np.inf
+    best_epoch = 0
+    epochs_without_improvement = 0
+    history = []
+    best_checkpoint = output_dir / "best.pth"
 
-    # ── Training loop ──
-    best_auc       = 0.0
-    patience_count = 0
-    patience       = cfg['training']['early_stopping_patience']
-
-    print(f'\nStarting training — {epochs} epochs\n')
-    print(f'{"Epoch":>6} {"Train Loss":>12} {"Val Loss":>10} {"Val AUC":>10} {"Best AUC":>10}')
-    print('-' * 55)
+    print(f"Device      : {device}")
+    print(f"Run         : {run_name}")
+    print(f"Backbone    : {cfg['model']['backbone']}")
+    print(f"Seed        : {seed}")
+    print(f"Output      : {output_dir}\n")
 
     for epoch in range(1, epochs + 1):
-        t0 = time.time()
-
+        started = time.time()
         train_loss = train_epoch(
-            model, loaders['train'], optimizer, criterion,
-            scaler, device, use_amp, cfg['training']['grad_clip']
+            model,
+            loaders["train"],
+            optimizer,
+            criterion,
+            scaler,
+            device,
+            use_amp,
+            grad_clip,
         )
-        val_loss, val_aucs = evaluate(
-            model, loaders['val'], criterion, device,
-            use_amp, class_names
+        val_loss, _, _, val_metrics = evaluate(
+            model,
+            loaders["val"],
+            criterion,
+            device,
+            use_amp,
         )
-
-        if scheduler:
+        if scheduler is not None:
             scheduler.step()
 
-        mean_auc = val_aucs['mean']
-        elapsed  = time.time() - t0
-        print(f'{epoch:>6} {train_loss:>12.4f} {val_loss:>10.4f} {mean_auc:>10.4f} {best_auc:>10.4f}  [{elapsed:.0f}s]')
+        val_auc = val_metrics["macro_auroc"]
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_macro_auroc": val_auc,
+            "val_macro_auprc": val_metrics["macro_auprc"],
+            "lr": optimizer.param_groups[0]["lr"],
+            "epoch_seconds": time.time() - started,
+        }
+        history.append(row)
 
-        if mean_auc > best_auc:
-            best_auc = mean_auc
-            patience_count = 0
-            ckpt_path = save_dir / f'{cfg["model"]["backbone"]}_best.pth'
-            torch.save({
-                'epoch':               epoch,
-                'model_state_dict':    model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_auc':             mean_auc,
-                'val_aucs':            val_aucs,
-                'config':              cfg,
-            }, ckpt_path)
-            print(f'         ✓ Saved checkpoint → {ckpt_path}')
+        print(
+            f"Epoch {epoch:02d} | train={train_loss:.4f} | val={val_loss:.4f} | "
+            f"AUROC={val_auc:.4f} | AUPRC={val_metrics['macro_auprc']:.4f}"
+        )
+
+        if val_auc is not None and val_auc > best_auc:
+            best_auc = val_auc
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": cfg,
+                    "seed": seed,
+                    "val_metrics": val_metrics,
+                },
+                best_checkpoint,
+            )
+            write_json(output_dir / "best_validation_metrics.json", val_metrics)
         else:
-            patience_count += 1
-            if patience_count >= patience:
-                print(f'\nEarly stopping at epoch {epoch} (patience={patience})')
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                print(f"Early stopping after epoch {epoch}.")
                 break
 
-    # ── Final test evaluation ──
-    print('\nRunning test set evaluation...')
-    test_loss, test_aucs = evaluate(
-        model, loaders['test'], criterion, device,
-        use_amp, class_names
+    with (output_dir / "training_history.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(history[0].keys()))
+        writer.writeheader()
+        writer.writerows(history)
+
+    checkpoint = torch.load(best_checkpoint, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    test_loss, test_labels, test_probs, test_metrics = evaluate(
+        model,
+        loaders["test"],
+        criterion,
+        device,
+        use_amp,
     )
-    print(f'\nTest Loss : {test_loss:.4f}')
-    print(f'Test AUC  : {test_aucs["mean"]:.4f}')
-    print('\nPer-class AUC:')
-    for name, auc in test_aucs.items():
-        if name != 'mean':
-            print(f'  {name:<25} {auc:.4f}')
+    test_metrics["loss"] = test_loss
+    test_metrics["best_validation_epoch"] = best_epoch
+    write_json(output_dir / "test_metrics.json", test_metrics)
+    save_predictions(output_dir / "test_predictions.csv", test_labels, test_probs)
 
-    print('\nTraining complete!')
+    print("\nFinal test results")
+    print(f"Macro AUROC: {test_metrics['macro_auroc']:.4f}")
+    print(f"Macro AUPRC: {test_metrics['macro_auprc']:.4f}")
+    print(f"Artifacts  : {output_dir}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

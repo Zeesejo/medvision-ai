@@ -1,4 +1,3 @@
-# Convenience default. Publication runs should use a named config under configs/.
 project:
   name: medvision-ai
   experiment_id: E01_densenet121_asl
