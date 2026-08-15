@@ -1,146 +1,198 @@
 """
-prepare_csv.py — Generate train_val.csv, val.csv, test.csv for MedVision-AI
-============================================================================
+Prepare deterministic NIH ChestX-ray14 train/validation/test manifests.
 
-Reads the official NIH ChestX-ray14 metadata and split lists, one-hot
-encodes the 14 pathology labels, resolves each image to its actual path
-(images live in images_001 … images_012 sub-folders), and writes:
+The official NIH train/test split is preserved. The train pool is further split
+into train/validation sets at the patient level when a patient identifier is
+available, preventing the same patient from appearing in both partitions.
 
-    <archive_dir>/train_val.csv   — training + validation pool
-    <archive_dir>/val.csv         — 10 % random hold-out from train_val
-    <archive_dir>/test.csv        — official test split
-
-Usage (run once before training):
-    python scripts/prepare_csv.py
-
-Or with explicit paths:
-    python scripts/prepare_csv.py \\
-        --archive_dir "F:/NIH Chest X-Ray dataset/archive" \\
-        --val_frac 0.10 \\
+Example:
+    python scripts/prepare_csv.py \
+        --archive_dir /path/to/nih-chestxray14 \
+        --output_dir data/splits \
+        --val_frac 0.10 \
         --seed 42
 """
 
-import os
-import argparse
-import pandas as pd
-from sklearn.model_selection import train_test_split
+from __future__ import annotations
 
-CLASSES = [
-    "Atelectasis", "Cardiomegaly", "Effusion", "Infiltration",
-    "Mass", "Nodule", "Pneumonia", "Pneumothorax",
-    "Consolidation", "Edema", "Emphysema", "Fibrosis",
-    "Pleural_Thickening", "Hernia",
-]
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
+
+from src.constants import CLASS_NAMES
 
 IMAGE_SUBDIRS = [f"images_{i:03d}/images" for i in range(1, 13)]
 
 
 def find_image(archive_dir: str, filename: str) -> str | None:
-    """Return the full path to filename searching all images_00x sub-folders."""
     for sub in IMAGE_SUBDIRS:
-        p = os.path.join(archive_dir, sub, filename)
-        if os.path.isfile(p):
-            return p
-    # Flat fallback (some Kaggle archives extract without sub-folders)
-    p = os.path.join(archive_dir, "images", filename)
-    if os.path.isfile(p):
-        return p
+        candidate = os.path.join(archive_dir, sub, filename)
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+
+    candidate = os.path.join(archive_dir, "images", filename)
+    if os.path.isfile(candidate):
+        return os.path.abspath(candidate)
     return None
 
 
-def build_dataframe(archive_dir: str, filenames: list[str]) -> pd.DataFrame:
-    """
-    Load Data_Entry_2017.csv, filter to filenames, resolve image paths,
-    one-hot encode labels, and drop rows whose image is missing on disk.
-    """
+def load_metadata(archive_dir: str) -> pd.DataFrame:
     meta_path = os.path.join(archive_dir, "Data_Entry_2017.csv")
     meta = pd.read_csv(meta_path)
+    required = {"Image Index", "Finding Labels"}
+    missing = required.difference(meta.columns)
+    if missing:
+        raise ValueError(f"Missing required metadata columns: {sorted(missing)}")
+    return meta
 
-    # Keep only the rows in our split
-    meta = meta[meta["Image Index"].isin(set(filenames))].copy()
 
-    # One-hot encode the pipe-separated Finding Labels column
-    for cls in CLASSES:
-        meta[cls] = meta["Finding Labels"].apply(
-            lambda s: 1 if cls in str(s).split("|") else 0
+def build_dataframe(meta: pd.DataFrame, archive_dir: str, filenames: list[str]) -> pd.DataFrame:
+    frame = meta[meta["Image Index"].isin(set(filenames))].copy()
+
+    for cls in CLASS_NAMES:
+        frame[cls] = frame["Finding Labels"].apply(
+            lambda value: int(cls in str(value).split("|"))
         )
 
-    # Resolve each image to its actual path on disk
-    print(f"  Resolving {len(meta):,} image paths …", end="", flush=True)
-    meta["image_path"] = meta["Image Index"].apply(
-        lambda fn: find_image(archive_dir, fn)
+    print(f"Resolving {len(frame):,} image paths ...", end="", flush=True)
+    frame["image_path"] = frame["Image Index"].apply(
+        lambda filename: find_image(archive_dir, filename)
     )
-    missing = meta["image_path"].isna().sum()
-    meta = meta.dropna(subset=["image_path"])
-    print(f" done  ({missing} missing files skipped)")
+    missing = int(frame["image_path"].isna().sum())
+    frame = frame.dropna(subset=["image_path"]).reset_index(drop=True)
+    print(f" done ({missing} missing files skipped)")
 
-    # Keep only columns the trainer needs
-    keep = ["Image Index", "image_path"] + CLASSES
-    return meta[keep].reset_index(drop=True)
+    keep = ["Image Index", "image_path"]
+    if "Patient ID" in frame.columns:
+        keep.append("Patient ID")
+    keep.extend(CLASS_NAMES)
+    return frame[keep]
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Prepare NIH ChestX-ray14 CSVs")
-    parser.add_argument(
-        "--archive_dir",
-        default="F:/NIH Chest X-Ray dataset/archive",
-        help="Root of the NIH archive (contains Data_Entry_2017.csv)",
+def split_train_validation(
+    pool: pd.DataFrame,
+    val_frac: float,
+    seed: int,
+    strategy: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    if strategy == "patient" and "Patient ID" in pool.columns:
+        splitter = GroupShuffleSplit(n_splits=1, test_size=val_frac, random_state=seed)
+        train_idx, val_idx = next(splitter.split(pool, groups=pool["Patient ID"]))
+        train_df = pool.iloc[train_idx].copy()
+        val_df = pool.iloc[val_idx].copy()
+        effective_strategy = "patient"
+    else:
+        train_df, val_df = train_test_split(
+            pool,
+            test_size=val_frac,
+            random_state=seed,
+            shuffle=True,
+        )
+        effective_strategy = "image"
+
+    return (
+        train_df.reset_index(drop=True),
+        val_df.reset_index(drop=True),
+        effective_strategy,
     )
-    parser.add_argument(
-        "--val_frac", type=float, default=0.10,
-        help="Fraction of train_val to hold out as val.csv (default 0.10)",
-    )
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Prepare reproducible ChestX-ray14 split CSVs")
+    parser.add_argument("--archive_dir", required=True, help="Root of the NIH ChestX-ray14 archive")
+    parser.add_argument("--output_dir", default="data/splits", help="Where split manifests are written")
+    parser.add_argument("--val_frac", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--strategy",
+        choices=["patient", "image"],
+        default="patient",
+        help="Validation split strategy. Patient-level is preferred for publication runs.",
+    )
     args = parser.parse_args()
 
-    arch = args.archive_dir
+    archive_dir = os.path.abspath(args.archive_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Load official split lists ─────────────────────────────────────────────
-    tv_list_path = os.path.join(arch, "train_val_list.txt")
-    te_list_path = os.path.join(arch, "test_list.txt")
+    meta = load_metadata(archive_dir)
 
-    with open(tv_list_path) as f:
-        train_val_files = [l.strip() for l in f if l.strip()]
-    with open(te_list_path) as f:
-        test_files = [l.strip() for l in f if l.strip()]
+    with open(os.path.join(archive_dir, "train_val_list.txt"), encoding="utf-8") as handle:
+        train_val_files = [line.strip() for line in handle if line.strip()]
+    with open(os.path.join(archive_dir, "test_list.txt"), encoding="utf-8") as handle:
+        test_files = [line.strip() for line in handle if line.strip()]
 
-    print(f"train_val pool : {len(train_val_files):,} images")
-    print(f"test pool      : {len(test_files):,} images")
+    print(f"Official train/val pool: {len(train_val_files):,} images")
+    print(f"Official test pool     : {len(test_files):,} images")
 
-    # ── Build DataFrames ──────────────────────────────────────────────────────
-    print("\nBuilding train_val DataFrame …")
-    tv_df = build_dataframe(arch, train_val_files)
-
-    print("Building test DataFrame …")
-    te_df = build_dataframe(arch, test_files)
-
-    # ── Split train_val → train + val ─────────────────────────────────────────
-    train_df, val_df = train_test_split(
-        tv_df, test_size=args.val_frac, random_state=args.seed
+    train_val_pool = build_dataframe(meta, archive_dir, train_val_files)
+    test_df = build_dataframe(meta, archive_dir, test_files)
+    train_df, val_df, effective_strategy = split_train_validation(
+        train_val_pool,
+        val_frac=args.val_frac,
+        seed=args.seed,
+        strategy=args.strategy,
     )
-    train_df = train_df.reset_index(drop=True)
-    val_df   = val_df.reset_index(drop=True)
 
-    # ── Write CSVs ────────────────────────────────────────────────────────────
-    tv_csv  = os.path.join(arch, "train_val.csv")
-    val_csv = os.path.join(arch, "val.csv")
-    te_csv  = os.path.join(arch, "test.csv")
+    if effective_strategy == "patient":
+        train_patients = set(train_df["Patient ID"].tolist())
+        val_patients = set(val_df["Patient ID"].tolist())
+        overlap = train_patients.intersection(val_patients)
+        if overlap:
+            raise RuntimeError(f"Patient leakage detected between train and validation: {len(overlap)} patients")
 
-    train_df.to_csv(tv_csv,  index=False)
-    val_df.to_csv(val_csv,   index=False)
-    te_df.to_csv(te_csv,     index=False)
+    paths = {
+        "train": output_dir / "train.csv",
+        "val": output_dir / "val.csv",
+        "test": output_dir / "test.csv",
+    }
+    train_df.to_csv(paths["train"], index=False)
+    val_df.to_csv(paths["val"], index=False)
+    test_df.to_csv(paths["test"], index=False)
 
-    print(f"\n✓ train_val.csv  → {tv_csv}   ({len(train_df):,} rows)")
-    print(f"✓ val.csv        → {val_csv}  ({len(val_df):,} rows)")
-    print(f"✓ test.csv       → {te_csv}   ({len(te_df):,} rows)")
-    print("\nDone — now run:")
-    print(f"  python src/train_v3.py "
-          f"--train_csv \"{tv_csv}\" "
-          f"--val_csv \"{val_csv}\" "
-          f"--img_dir \"{arch}\" "
-          f"--backbone densenet121 "
-          f"--wb_entity zeemaokik-university-of-bremen "
-          f"--num_workers 0")
+    manifest = {
+        "dataset": "NIH ChestX-ray14",
+        "archive_dir": archive_dir,
+        "seed": args.seed,
+        "requested_strategy": args.strategy,
+        "effective_strategy": effective_strategy,
+        "validation_fraction": args.val_frac,
+        "counts": {
+            "train": len(train_df),
+            "val": len(val_df),
+            "test": len(test_df),
+        },
+        "split_files": {
+            name: {
+                "path": str(path),
+                "sha256": sha256_file(path),
+            }
+            for name, path in paths.items()
+        },
+    }
+
+    manifest_path = output_dir / "split_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    print("\nPrepared split manifests")
+    print(f"Strategy: {effective_strategy}")
+    print(f"Train   : {len(train_df):,}")
+    print(f"Val     : {len(val_df):,}")
+    print(f"Test    : {len(test_df):,}")
+    print(f"Manifest: {manifest_path}")
 
 
 if __name__ == "__main__":
