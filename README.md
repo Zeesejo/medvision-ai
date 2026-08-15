@@ -1,211 +1,170 @@
- > [!WARNING]
-> ## ⚠️ Work in Progress — Unpublished Research
->
-> **This repository contains active, ongoing research for an unpublished academic paper.**
->
-> - The code, methodology, models, and results are **incomplete and subject to major changes**
-> - The associated paper has **not yet been peer-reviewed or submitted**
-> - **Do not fork, clone, cite, or build upon this work** without explicit written permission from the author
-> - Unauthorized use of this research may constitute academic misconduct
->
-> 📬 For collaboration or inquiries, contact: **[Zeeshan Modi](https://github.com/Zeesejo)**
+# MedVision-AI
 
----
+**Reproducible research on multi-label chest X-ray classification**  
+NIH ChestX-ray14 · PyTorch · DenseNet/ResNet · Asymmetric Loss · Explainability
 
-# 🩺 MedVision AI
+> **Research status:** active, unpublished work. The repository contains completed baseline experiments as well as unfinished research prototypes. Only results explicitly listed as **completed** below should be treated as experimental findings.
 
-> **Medical Computer Vision Research Project**  
-> Self-supervised learning, Explainable AI, and Fairness in Medical Imaging  
-> University of Bremen — M.Sc. AI/IS
+## Why this repository exists
 
-[![CI](https://github.com/Zeesejo/medvision-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/Zeesejo/medvision-ai/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-orange)](https://pytorch.org/)
+MedVision-AI studies multi-label chest pathology classification on the NIH ChestX-ray14 dataset. The project is being reorganized around a publication-quality workflow: reproducible training, preserved experiment provenance, controlled ablations, uncertainty reporting, explainability evaluation, and subgroup analysis.
 
----
+The current repository should be understood in two layers:
 
-## 🎯 Project Overview
+1. **Completed historical baseline experiments** — ResNet-50 and DenseNet-121 test AUROC artifacts are committed.
+2. **Research directions under development** — self-supervised learning, fairness auditing, ViT experiments, SHAP, and quantitative XAI are implemented or scaffolded to varying degrees but do **not** yet have complete committed result sets.
 
-MedVision AI is a research codebase for multi-label chest pathology classification on the **NIH ChestX-ray14** dataset (112,120 frontal-view X-rays, 14 disease labels). The project targets publication at **MICCAI, MIDL, or ISBI** and focuses on three pillars:
+## Completed results
 
-- **Label efficiency** — self-supervised pretraining (SimCLR / BYOL) to reduce annotation cost
-- **Explainability** — GradCAM + SHAP prototype explanations for clinical trust
-- **Fairness** — demographic subgroup auditing to surface and mitigate bias
+The strongest auditable result artifacts currently committed under `results/metrics/` are:
 
----
+| Backbone | Mean AUROC | Status |
+|---|---:|---|
+| DenseNet-121 | **0.7978** | completed historical run |
+| ResNet-50 | **0.7067** | completed historical run |
 
-## 📁 Repository Structure
+DenseNet-121 had higher recorded AUROC than ResNet-50 for all 14 pathologies in these artifacts.
 
+> These are historical single-run artifacts, not a claim of state-of-the-art performance. The exact historical runtime environment, raw predictions, checkpoints, and all experiment logs were not preserved in Git. The current cleanup therefore treats these values as **baseline evidence to reproduce**, not as the final publication result.
+
+Per-class metrics are available in:
+
+```text
+results/metrics/densenet121_auc.json
+results/metrics/resnet50_auc.json
 ```
+
+## Research status
+
+| Component | Status |
+|---|---|
+| DenseNet-121 baseline | ✅ completed result artifact |
+| ResNet-50 baseline | ✅ completed result artifact |
+| ROC figures | ✅ committed |
+| Asymmetric Loss implementation | ✅ implemented |
+| BCE / Focal / ASL controlled ablation | 🟡 planned / needs rerun |
+| ViT comparison | 🟡 config/code exists; no completed result artifact |
+| SimCLR / SSL | 🟡 prototype; no completed NIH downstream result |
+| Grad-CAM | 🟡 implementation exists; quantitative validation pending |
+| SHAP | 🟡 prototype |
+| Fairness by age/sex | 🟡 scaffold; real audit pending |
+| Calibration analysis | 🔴 not yet part of the completed study |
+| Multi-seed confidence intervals | 🔴 not yet part of the completed study |
+| External validation | 🔴 not yet completed |
+
+See [`docs/RESEARCH_STATUS.md`](docs/RESEARCH_STATUS.md) for the evidence/provenance audit.
+
+## Repository layout
+
+```text
 medvision-ai/
+├── config.yaml                 # current baseline configuration
+├── configs/                    # experimental configurations
 ├── src/
-│   ├── dataset.py          # ChestXrayDataset, class weights, transforms
-│   ├── train.py            # Main training loop (AMP, mixed precision)
-│   ├── evaluate.py         # Inference, AUC computation, ROC curves
-│   ├── losses.py           # WeightedBCE, FocalLoss, AsymmetricLoss (ASL)
-│   └── models/             # Backbone wrappers (ResNet, DenseNet, ViT)
-├── tests/                  # Pytest unit tests
-├── experiments/            # Config YAMLs and ablation results
-├── docs/                   # Research notes and experiment logs
-├── .github/
-│   ├── workflows/ci.yml    # Lint + test on every PR
-│   └── ISSUE_TEMPLATE/     # Bug, feature, experiment templates
-├── CONTRIBUTING.md
-└── README.md
+│   ├── data/                   # dataset and loader code
+│   ├── models/                 # classifier/backbone wrappers
+│   ├── ssl_pretrain/           # SSL research code
+│   ├── xai/                    # Grad-CAM / SHAP code
+│   ├── losses.py
+│   ├── train.py                # current canonical trainer candidate
+│   └── evaluate.py
+├── experiments/
+│   ├── fairness/
+│   ├── finetune/
+│   ├── ssl/
+│   └── xai/
+├── results/
+│   ├── metrics/                # committed historical metrics
+│   └── figures/                # committed figures
+├── reproducibility/            # experiment provenance templates
+├── paper/                      # manuscript materials
+├── tests/
+└── docs/
 ```
 
----
+## Dataset
 
-## ⚙️ Installation
+This project uses the **NIH ChestX-ray14** dataset: 112,120 frontal chest radiographs with 14 automatically extracted pathology labels.
 
-### Option 1 — Conda (recommended)
+Expected metadata/split files include:
+
+```text
+Data_Entry_2017.csv
+train_val_list.txt
+test_list.txt
+```
+
+The official NIH train/test lists are used by the dataset loader. The internal validation strategy is being reviewed as part of the reproducibility cleanup; publication experiments should use an explicitly documented patient-disjoint protocol.
+
+Dataset images are **not** distributed in this repository.
+
+## Environment
+
+Conda:
 
 ```bash
-git clone https://github.com/Zeesejo/medvision-ai.git
-cd medvision-ai
 conda env create -f environment.yml
 conda activate medvision
 ```
 
-### Option 2 — pip
+or install the Python dependencies from `requirements.txt` where applicable.
+
+## Training
+
+The current main trainer reads `config.yaml` by default and supports CLI overrides:
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install -r requirements.txt
+python src/train.py
+python src/train.py --backbone densenet121
+python src/train.py --backbone resnet50
+python src/train.py --epochs 30 --lr 1e-4
+python src/train.py --loss asl
+python src/train.py --data_dir /path/to/nih-chestxray14
 ```
 
----
+### Important reproducibility note
 
-## 🗂️ Dataset Setup
+Multiple trainer generations (`train.py`, `train_v2.py`, `train_v3.py`) exist in the historical codebase and contain different training strategies. The publication cleanup will consolidate these into one canonical trainer before new headline results are reported.
 
-1. Download **NIH ChestX-ray14** from the [official source](https://nihcc.app.box.com/v/ChestXray-NIHCC) or via the NIH CLI tool.
-2. Place files in the following structure:
+## Evaluation
 
-```
-data/
-├── images/
-│   ├── 00000001_000.png
-│   └── ...
-├── Data_Entry_2017.csv
-├── train_val_list.txt
-└── test_list.txt
-```
+`src/evaluate.py` computes per-class ROC-AUC and the macro mean AUROC from a saved checkpoint. For future publication runs, evaluation will additionally preserve raw predictions and include AUPRC, calibration metrics, bootstrap confidence intervals, and subgroup metrics.
 
-3. Update `data_dir` in your config YAML (see `experiments/default.yaml`).
+## Publication roadmap
 
----
+The next experimental sequence is intentionally controlled:
 
-## 🏋️ Training
+1. make one canonical deterministic training/evaluation pipeline;
+2. reproduce the DenseNet-121 and ResNet-50 historical baselines;
+3. run BCE vs Focal vs ASL under identical conditions;
+4. run multiple random seeds and bootstrap confidence intervals;
+5. evaluate self-supervised pretraining under reduced label budgets;
+6. add calibration and age/sex subgroup analysis;
+7. quantitatively evaluate Grad-CAM/localization where annotations permit;
+8. perform external validation if a compatible dataset/protocol is selected.
 
-```bash
-# Train with default config (ResNet-50, ASL loss, 30 epochs)
-python src/train.py --config experiments/default.yaml
+## Reproducibility policy for new experiments
 
-# Train with DenseNet-121
-python src/train.py --config experiments/default.yaml --backbone densenet121
+Every new publication-facing run should preserve:
 
-# Train with ViT-Base
-python src/train.py --config experiments/default.yaml --backbone vit_base_patch16_224
+- Git commit SHA
+- configuration file
+- random seed
+- dataset/split identifiers or hashes
+- environment/package versions
+- checkpoint identifier
+- raw test probabilities and labels
+- per-class metrics
+- aggregate metrics
+- training history
+- generated figures
 
-# Disable AMP (e.g., CPU debug)
-python src/train.py --config experiments/default.yaml --no-amp
-```
+The template lives in [`reproducibility/`](reproducibility/).
 
-Checkpoints are saved to `results/checkpoints/` and metrics are logged to **Weights & Biases** if `wandb.enabled: true` in config.
+## Paper
 
----
+The `paper/` directory contains manuscript material. Until a submission/preprint is explicitly linked here, the manuscript and repository should be treated as **unpublished ongoing research**.
 
-## 📊 Evaluation
+## License
 
-```bash
-# Run inference and generate per-class AUC + ROC curves
-python src/evaluate.py --checkpoint results/checkpoints/best.pth --config experiments/default.yaml
-```
-
-Outputs written to `results/`:
-- `roc_curves.png` — per-class ROC grid
-- `auc_summary.json` — per-class and mean AUC
-- `predictions.npy` — raw probabilities for further analysis
-
----
-
-## 📈 Results
-
-> **Baseline results on NIH ChestX-ray14 test split (ResNet-50, ASL, 30 epochs)**
-
-| Pathology | AUC |
-|---|---|
-| Atelectasis | 0.814 |
-| Cardiomegaly | 0.891 |
-| Effusion | 0.883 |
-| Infiltration | 0.709 |
-| Mass | 0.839 |
-| Nodule | 0.763 |
-| Pneumonia | 0.762 |
-| Pneumothorax | 0.872 |
-| Consolidation | 0.793 |
-| Edema | 0.882 |
-| Emphysema | 0.921 |
-| Fibrosis | 0.805 |
-| Pleural Thickening | 0.782 |
-| Hernia | 0.924 |
-| **Mean AUC** | **0.832** |
-
----
-
-## 🔬 XAI — Explainability
-
-Generate GradCAM heatmaps for any input image:
-
-```bash
-python src/xai/gradcam.py \
-  --image data/images/00000001_000.png \
-  --checkpoint results/checkpoints/best.pth \
-  --class Effusion
-```
-
-SHAP prototype explanations (coming in v2):
-
-```bash
-python src/xai/shap_explain.py --checkpoint results/checkpoints/best.pth
-```
-
----
-
-## 🧪 Running Tests
-
-```bash
-pip install pytest
-pytest tests/ -v
-```
-
-CI runs automatically on every PR via GitHub Actions.
-
----
-
-## 📝 Citation
-
-If you use this codebase in your research, please cite:
-
-```bibtex
-@misc{modi2026medvision,
-  author    = {Zeeshan Modi},
-  title     = {MedVision AI: Multi-label Chest Pathology Classification with XAI and Fairness},
-  year      = {2026},
-  publisher = {GitHub},
-  url       = {https://github.com/Zeesejo/medvision-ai}
-}
-```
-
----
-
-## 🤝 Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for branching strategy, commit message format, and how to file issues.
-
----
-
-## 📄 License
-
-MIT License — see [LICENSE](LICENSE)
+MIT License. Dataset licensing and access terms are governed separately by the NIH ChestX-ray14 source.
