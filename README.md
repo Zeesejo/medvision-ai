@@ -3,168 +3,194 @@
 **Reproducible research on multi-label chest X-ray classification**  
 NIH ChestX-ray14 · PyTorch · DenseNet/ResNet · Asymmetric Loss · Explainability
 
-> **Research status:** active, unpublished work. The repository contains completed baseline experiments as well as unfinished research prototypes. Only results explicitly listed as **completed** below should be treated as experimental findings.
+> **Research status:** active, unpublished work. The repository contains completed historical baseline artifacts and research components that are still being validated. Only results explicitly marked as completed below should be treated as experimental findings.
 
-## Why this repository exists
+## Research objective
 
-MedVision-AI studies multi-label chest pathology classification on the NIH ChestX-ray14 dataset. The project is being reorganized around a publication-quality workflow: reproducible training, preserved experiment provenance, controlled ablations, uncertainty reporting, explainability evaluation, and subgroup analysis.
+MedVision-AI studies multi-label chest pathology classification on NIH ChestX-ray14 with an emphasis on **reproducibility, label efficiency, class imbalance, calibration, explainability, and subgroup robustness**.
 
-The current repository should be understood in two layers:
+The repository is currently being converted from an exploratory research codebase into a publication-grade experiment pipeline. Historical artifacts are preserved rather than silently rewritten, while new runs follow a stricter provenance policy.
 
-1. **Completed historical baseline experiments** — ResNet-50 and DenseNet-121 test AUROC artifacts are committed.
-2. **Research directions under development** — self-supervised learning, fairness auditing, ViT experiments, SHAP, and quantitative XAI are implemented or scaffolded to varying degrees but do **not** yet have complete committed result sets.
+## Completed historical results
 
-## Completed results
-
-The strongest auditable result artifacts currently committed under `results/metrics/` are:
+The strongest auditable metric artifacts currently committed under `results/metrics/` are:
 
 | Backbone | Mean AUROC | Status |
 |---|---:|---|
 | DenseNet-121 | **0.7978** | completed historical run |
 | ResNet-50 | **0.7067** | completed historical run |
 
-DenseNet-121 had higher recorded AUROC than ResNet-50 for all 14 pathologies in these artifacts.
+DenseNet-121 had higher recorded AUROC than ResNet-50 for all 14 pathologies in those artifacts.
 
-> These are historical single-run artifacts, not a claim of state-of-the-art performance. The exact historical runtime environment, raw predictions, checkpoints, and all experiment logs were not preserved in Git. The current cleanup therefore treats these values as **baseline evidence to reproduce**, not as the final publication result.
-
-Per-class metrics are available in:
+These are **historical single-run results**, not state-of-the-art claims. Raw predictions, the exact runtime environment, and every historical checkpoint were not preserved in Git, so these values are treated as baseline evidence to reproduce.
 
 ```text
 results/metrics/densenet121_auc.json
 results/metrics/resnet50_auc.json
 ```
 
-## Research status
+## What is completed vs planned
 
 | Component | Status |
 |---|---|
-| DenseNet-121 baseline | ✅ completed result artifact |
-| ResNet-50 baseline | ✅ completed result artifact |
-| ROC figures | ✅ committed |
-| Asymmetric Loss implementation | ✅ implemented |
-| BCE / Focal / ASL controlled ablation | 🟡 planned / needs rerun |
-| ViT comparison | 🟡 config/code exists; no completed result artifact |
-| SimCLR / SSL | 🟡 prototype; no completed NIH downstream result |
-| Grad-CAM | 🟡 implementation exists; quantitative validation pending |
-| SHAP | 🟡 prototype |
-| Fairness by age/sex | 🟡 scaffold; real audit pending |
-| Calibration analysis | 🔴 not yet part of the completed study |
-| Multi-seed confidence intervals | 🔴 not yet part of the completed study |
-| External validation | 🔴 not yet completed |
+| DenseNet-121 historical baseline | completed result artifact |
+| ResNet-50 historical baseline | completed result artifact |
+| Historical ROC figures | committed |
+| Asymmetric Loss | implemented |
+| Canonical reproducible trainer | implemented on cleanup branch |
+| Patient-disjoint validation split generation | implemented on cleanup branch |
+| BCE / Focal / ASL controlled ablation | planned |
+| ViT comparison | code/config exists; no completed result artifact |
+| SimCLR / SSL | prototype; no completed NIH downstream result |
+| Grad-CAM | implementation exists; quantitative validation pending |
+| Fairness by age/sex | scaffold; real audit pending |
+| Calibration analysis | planned |
+| Multi-seed confidence intervals | planned |
+| External validation | not yet completed |
 
-See [`docs/RESEARCH_STATUS.md`](docs/RESEARCH_STATUS.md) for the evidence/provenance audit.
+See [`docs/RESEARCH_STATUS.md`](docs/RESEARCH_STATUS.md) for the evidence and provenance audit.
 
-## Repository layout
+## Repository structure
 
 ```text
 medvision-ai/
-├── config.yaml                 # current baseline configuration
-├── configs/                    # experimental configurations
+├── configs/
+│   └── baseline_densenet121_asl.yaml   # canonical baseline experiment
+├── scripts/
+│   └── prepare_csv.py                  # deterministic split generation
 ├── src/
-│   ├── data/                   # dataset and loader code
-│   ├── models/                 # classifier/backbone wrappers
-│   ├── ssl_pretrain/           # SSL research code
-│   ├── xai/                    # Grad-CAM / SHAP code
+│   ├── constants.py                    # canonical class definitions
+│   ├── dataset.py                      # canonical CSV-backed dataset
+│   ├── models/
 │   ├── losses.py
-│   ├── train.py                # current canonical trainer candidate
-│   └── evaluate.py
-├── experiments/
-│   ├── fairness/
-│   ├── finetune/
-│   ├── ssl/
-│   └── xai/
+│   ├── reproducibility.py              # seed + environment/provenance utilities
+│   ├── train.py                        # canonical train + test runner
+│   ├── xai/
+│   └── ssl_pretrain/
+├── experiments/                        # research prototypes / older experiment code
 ├── results/
-│   ├── metrics/                # committed historical metrics
-│   └── figures/                # committed figures
-├── reproducibility/            # experiment provenance templates
-├── paper/                      # manuscript materials
+│   ├── metrics/                        # committed historical metrics
+│   ├── figures/                        # committed historical figures
+│   └── runs/                           # generated publication-facing runs; gitignored
+├── reproducibility/
+├── paper/
 ├── tests/
 └── docs/
 ```
 
 ## Dataset
 
-This project uses the **NIH ChestX-ray14** dataset: 112,120 frontal chest radiographs with 14 automatically extracted pathology labels.
+The project uses **NIH ChestX-ray14**, containing 112,120 frontal chest radiographs with 14 automatically extracted pathology labels.
 
-Expected metadata/split files include:
+Expected source files include:
 
 ```text
 Data_Entry_2017.csv
 train_val_list.txt
 test_list.txt
+images_001/ ... images_012/
 ```
 
-The official NIH train/test lists are used by the dataset loader. The internal validation strategy is being reviewed as part of the reproducibility cleanup; publication experiments should use an explicitly documented patient-disjoint protocol.
+Dataset images are not distributed in this repository.
 
-Dataset images are **not** distributed in this repository.
+### Prepare reproducible splits
+
+The official NIH train/test lists are preserved. The publication pipeline creates the internal validation set at the **patient level** when `Patient ID` is available, preventing train/validation patient overlap.
+
+```bash
+python -m scripts.prepare_csv \
+  --archive_dir /path/to/nih-chestxray14 \
+  --output_dir data/splits \
+  --strategy patient \
+  --val_frac 0.10 \
+  --seed 42
+```
+
+The command writes:
+
+```text
+data/splits/train.csv
+data/splits/val.csv
+data/splits/test.csv
+data/splits/split_manifest.json
+```
+
+`split_manifest.json` records split counts, strategy, seed, and SHA-256 hashes of the generated CSV files.
+
+For historical reproduction investigations, `--strategy image` is retained as an explicit alternative. Publication-facing results should not mix the two protocols.
 
 ## Environment
-
-Conda:
 
 ```bash
 conda env create -f environment.yml
 conda activate medvision
 ```
 
-or install the Python dependencies from `requirements.txt` where applicable.
+## Canonical baseline run
 
-## Training
-
-The current main trainer reads `config.yaml` by default and supports CLI overrides:
+The publication workflow now uses one config-driven runner:
 
 ```bash
-python src/train.py
-python src/train.py --backbone densenet121
-python src/train.py --backbone resnet50
-python src/train.py --epochs 30 --lr 1e-4
-python src/train.py --loss asl
-python src/train.py --data_dir /path/to/nih-chestxray14
+python -m src.train --config configs/baseline_densenet121_asl.yaml
 ```
 
-### Important reproducibility note
+The named baseline config currently specifies DenseNet-121, 320 px inputs, ImageNet initialization, AdamW, Asymmetric Loss, deterministic seed 42, early stopping, and cosine learning-rate scheduling.
 
-Multiple trainer generations (`train.py`, `train_v2.py`, `train_v3.py`) exist in the historical codebase and contain different training strategies. The publication cleanup will consolidate these into one canonical trainer before new headline results are reported.
+Every run creates a dedicated directory such as:
 
-## Evaluation
+```text
+results/runs/E01_densenet121_asl_seed42/
+├── config.yaml
+├── environment.json
+├── run_manifest.json
+├── training_history.csv
+├── best.pth
+├── best_validation_metrics.json
+├── test_metrics.json
+└── test_predictions.csv
+```
 
-`src/evaluate.py` computes per-class ROC-AUC and the macro mean AUROC from a saved checkpoint. For future publication runs, evaluation will additionally preserve raw predictions and include AUPRC, calibration metrics, bootstrap confidence intervals, and subgroup metrics.
+The important change is that **raw test probabilities and labels are preserved**. Future confidence intervals, calibration, subgroup analysis, ROC/PR figures, and paired model comparisons can therefore be regenerated without retraining the network.
 
-## Publication roadmap
+## Historical trainers
 
-The next experimental sequence is intentionally controlled:
+`train_v2.py` and `train_v3.py` are retained for provenance because they represent earlier generations of the research code and use different training strategies. They should be treated as **legacy historical implementations**, not as competing publication entry points.
 
-1. make one canonical deterministic training/evaluation pipeline;
-2. reproduce the DenseNet-121 and ResNet-50 historical baselines;
-3. run BCE vs Focal vs ASL under identical conditions;
-4. run multiple random seeds and bootstrap confidence intervals;
+New publication-facing experiments should use `src/train.py` plus a named YAML config under `configs/`.
+
+## Publication experiment roadmap
+
+The experimental sequence is intentionally controlled:
+
+1. reproduce DenseNet-121 and ResNet-50 baselines with the canonical pipeline;
+2. run BCE vs Focal vs ASL under otherwise identical conditions;
+3. repeat key experiments across multiple fixed seeds;
+4. compute bootstrap confidence intervals and paired comparisons from stored predictions;
 5. evaluate self-supervised pretraining under reduced label budgets;
 6. add calibration and age/sex subgroup analysis;
-7. quantitatively evaluate Grad-CAM/localization where annotations permit;
-8. perform external validation if a compatible dataset/protocol is selected.
+7. quantitatively evaluate explanation localization where annotations permit;
+8. perform external validation under a clearly documented label mapping and protocol.
 
-## Reproducibility policy for new experiments
+## Reproducibility policy
 
-Every new publication-facing run should preserve:
+Every new publication-facing result should preserve:
 
 - Git commit SHA
-- configuration file
+- resolved experiment configuration
 - random seed
-- dataset/split identifiers or hashes
-- environment/package versions
-- checkpoint identifier
-- raw test probabilities and labels
-- per-class metrics
-- aggregate metrics
+- split strategy and split hashes
+- package / runtime environment
+- checkpoint
 - training history
-- generated figures
-
-The template lives in [`reproducibility/`](reproducibility/).
+- raw labels and predicted probabilities
+- per-class AUROC and AUPRC
+- aggregate metrics
+- generated figures and statistical analyses
 
 ## Paper
 
-The `paper/` directory contains manuscript material. Until a submission/preprint is explicitly linked here, the manuscript and repository should be treated as **unpublished ongoing research**.
+The `paper/` directory contains manuscript material. Until a submission or preprint is explicitly linked here, it should be treated as **ongoing unpublished research**.
 
 ## License
 
-MIT License. Dataset licensing and access terms are governed separately by the NIH ChestX-ray14 source.
+MIT License. NIH ChestX-ray14 licensing and access terms are governed separately by the dataset provider.
