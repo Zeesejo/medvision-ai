@@ -1,48 +1,42 @@
-classes:
-- Atelectasis
-- Cardiomegaly
-- Effusion
-- Infiltration
-- Mass
-- Nodule
-- Pneumonia
-- Pneumothorax
-- Consolidation
-- Edema
-- Emphysema
-- Fibrosis
-- Pleural_Thickening
-- Hernia
+# Convenience default. Publication runs should use a named config under configs/.
+project:
+  name: medvision-ai
+  experiment_id: E01_densenet121_asl
+  seed: 42
+  deterministic: true
+
 data:
-  data_dir: F:/NIH Chest X-Ray dataset/archive
+  train_csv: data/splits/train.csv
+  val_csv: data/splits/val.csv
+  test_csv: data/splits/test.csv
+  img_dir: data/nih-chestxray14
   image_size: 320
-  images_subdir: images
-  img_dir: F:/NIH Chest X-Ray dataset/archive
-  labels_file: F:/NIH Chest X-Ray dataset/archive/Data_Entry_2017.csv
+  batch_size: 32
   num_workers: 4
-  test_list: F:/NIH Chest X-Ray dataset/archive/test_list.txt
-  train_csv: F:/NIH Chest X-Ray dataset/archive/train_val.csv
-  train_val_list: F:/NIH Chest X-Ray dataset/archive/train_val_list.txt
-  val_csv: F:/NIH Chest X-Ray dataset/archive/val.csv
-logging:
-  log_every_n_steps: 50
-  project: medvision-ai
-  run_name: densenet121-320px-asl
-  save_dir: results/checkpoints
-  use_wandb: true
+
 model:
   backbone: densenet121
+  pretrained: true
   dropout: 0.3
   freeze_backbone: false
-  pretrained: true
+
 training:
-  amp: true
-  batch_size: 32
-  early_stopping_patience: 7
   epochs: 30
-  grad_clip: 1.0
   learning_rate: 0.0001
-  loss: asl
-  scheduler: cosine
-  warmup_epochs: 3
   weight_decay: 0.0001
+  grad_clip: 1.0
+  amp: true
+  early_stopping_patience: 7
+  scheduler: cosine
+  loss: asl_optimized
+  loss_config:
+    gamma_neg: 4
+    gamma_pos: 0
+    clip: 0.05
+    label_smoothing: 0.0
+
+logging:
+  output_root: results/runs
+  use_wandb: false
+  wandb_project: medvision-ai
+  wandb_entity: null
